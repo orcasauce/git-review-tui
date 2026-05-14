@@ -21,6 +21,7 @@ import (
 	"github.com/orcasauce/git-review-tui/gitcmd"
 	"github.com/orcasauce/git-review-tui/layout"
 	"github.com/orcasauce/git-review-tui/loader"
+	"github.com/orcasauce/git-review-tui/metadata"
 	"github.com/orcasauce/git-review-tui/searchfilter"
 )
 
@@ -165,14 +166,13 @@ type model struct {
 	fileSearchOriginIdx int
 	fileSearchOriginTop int
 
-	// Small-mode swap state. When the layout is collapsed to a single
-	// full-width column per section, each section shows its left panel
-	// by default; `enter` swaps the active section to its right panel
-	// (message for top, diff for bottom) and `q`/`esc` swaps back. The
-	// flags persist across small-mode entry/exit so the user's chosen
-	// view survives terminal resizes.
-	topShowRight    bool
-	bottomShowRight bool
+	// Small-mode swap state. When the top row collapses to a single
+	// full-width column, it shows the log panel by default; `enter`
+	// swaps it to the message panel and `q`/`esc` swaps back. The flag
+	// persists across small-mode entry/exit so the user's chosen view
+	// survives terminal resizes. The files and diff panels are always
+	// stacked full-width below the top row, so they need no swap.
+	topShowRight bool
 
 	// Help overlay state. When helpModalOpen is true the modal owns all
 	// keyboard input until the user dismisses it with `?`, `esc`, or `q`.
@@ -547,7 +547,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// churn selection / scroll state. The normal four-panel UI
 		// resumes from its prior state as soon as the terminal is resized
 		// back above the threshold.
-		if layout.Compute(m.w, m.h).TooSmall {
+		if layout.Compute(m.w, m.h, len(m.files)).TooSmall {
 			switch keyStr {
 			case "q", "ctrl+c":
 				return m, tea.Quit
@@ -617,16 +617,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.onFileSelectionChanged()
 			}
 		case "q", "esc":
-			// In small mode, the first "back" step un-swaps the active
-			// section from its right panel to its left panel before
+			// In small mode, the first "back" step un-swaps the top
+			// section from the message panel to the log panel before
 			// falling through to the usual bottom→top→quit ladder.
-			if layout.Compute(m.w, m.h).SmallMode {
+			if layout.Compute(m.w, m.h, len(m.files)).SmallMode {
 				if m.active == sectionTop && m.topShowRight {
 					m.topShowRight = false
-					return m, nil
-				}
-				if m.active == sectionBottom && m.bottomShowRight {
-					m.bottomShowRight = false
 					return m, nil
 				}
 			}
@@ -637,16 +633,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 		case "enter":
-			// In small mode `enter` swaps the active section to its
-			// right panel; outside small mode it activates the bottom
-			// (files) section from the top.
-			if layout.Compute(m.w, m.h).SmallMode {
+			// In small mode `enter` swaps the top row to the message
+			// panel; outside small mode it activates the bottom (files)
+			// section from the top. The bottom panels are always stacked
+			// full-width, so no swap is needed there.
+			if layout.Compute(m.w, m.h, len(m.files)).SmallMode {
 				if m.active == sectionTop {
 					m.topShowRight = true
-				} else {
-					m.bottomShowRight = true
+					return m, nil
 				}
-				return m, nil
 			}
 			if m.active == sectionTop {
 				m.active = sectionBottom
@@ -1147,7 +1142,6 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.fileSearchOriginTop = 0
 
 	m.topShowRight = false
-	m.bottomShowRight = false
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1392,7 +1386,7 @@ func (m *model) currentSelection() (sha, path string, ok bool) {
 // terminal is too small or any modal / search prompt is open so they
 // can't bypass those gates.
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		return m, nil
 	}
@@ -1406,12 +1400,11 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			delta = -1
 		}
 		msgRect, msgVisible := messagePanelRect(lo, m.topShowRight)
-		diffRect, diffVisible := diffPanelRect(lo, m.bottomShowRight)
 		if msgVisible && rectContains(msgRect, msg.X, msg.Y) {
 			m.scrollMessage(delta)
 			return m, nil
 		}
-		if diffVisible && rectContains(diffRect, msg.X, msg.Y) {
+		if rectContains(lo.Diff, msg.X, msg.Y) {
 			m.scrollDiff(delta)
 			return m, nil
 		}
@@ -1440,9 +1433,8 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		filesRect, filesVisible := filesPanelRect(lo, m.bottomShowRight)
-		if filesVisible && rectContains(filesRect, msg.X, msg.Y) {
-			row := msg.Y - filesRect.Y - 1
+		if rectContains(lo.Files, msg.X, msg.Y) {
+			row := msg.Y - lo.Files.Y - 1
 			if row < 0 {
 				return m, nil
 			}
@@ -1478,19 +1470,6 @@ func messagePanelRect(lo layout.Layout, topShowRight bool) (layout.Rect, bool) {
 	return lo.TopRight, true
 }
 
-// diffPanelRect returns the rectangle the diff panel currently occupies
-// and whether it is visible. Mirrors messagePanelRect for the bottom
-// section.
-func diffPanelRect(lo layout.Layout, bottomShowRight bool) (layout.Rect, bool) {
-	if lo.SmallMode {
-		if bottomShowRight {
-			return lo.BottomLeft, true
-		}
-		return layout.Rect{}, false
-	}
-	return lo.BottomRight, true
-}
-
 // logPanelRect returns the rectangle the log panel currently occupies
 // and whether it is visible. In full mode it is always TopLeft. In
 // small mode the same rectangle is shared with the message panel, so
@@ -1501,14 +1480,6 @@ func logPanelRect(lo layout.Layout, topShowRight bool) (layout.Rect, bool) {
 		return layout.Rect{}, false
 	}
 	return lo.TopLeft, true
-}
-
-// filesPanelRect mirrors logPanelRect for the bottom section.
-func filesPanelRect(lo layout.Layout, bottomShowRight bool) (layout.Rect, bool) {
-	if lo.SmallMode && bottomShowRight {
-		return layout.Rect{}, false
-	}
-	return lo.BottomLeft, true
 }
 
 // rectContains reports whether (x, y) falls inside r (half-open on the
@@ -1588,25 +1559,17 @@ func (m *model) clampDiffScroll() {
 }
 
 // diffPanelBodyHeight returns the visible body height (excluding the
-// title row) of the diff panel for the current terminal size. In
-// small-mode the diff panel only occupies the bottom rectangle when
-// the user has swapped that section to its right view; otherwise the
-// panel isn't rendered and the body height is zero.
+// title row) of the diff panel for the current terminal size. The diff
+// panel is always rendered in both small and full mode.
 func (m *model) diffPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		return 0
 	}
-	if lo.SmallMode {
-		if m.bottomShowRight {
-			return lo.BottomLeft.H - 1
-		}
-		return 0
-	}
-	return lo.BottomRight.H - 1
+	return lo.Diff.H - 1
 }
 
 // scrollMessage moves the message-panel viewport by `delta` lines,
@@ -1658,7 +1621,7 @@ func (m *model) msgPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		return 0
 	}
@@ -1713,7 +1676,7 @@ func (m *model) logBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		return 0
 	}
@@ -1749,11 +1712,11 @@ func (m *model) filesBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		return 0
 	}
-	return lo.BottomLeft.H - 1
+	return lo.Files.H - 1
 }
 
 var (
@@ -1926,12 +1889,6 @@ func visibleRefs(refs []string) []string {
 	return out
 }
 
-// nonTagRefs is the same filter as visibleRefs but for the message
-// panel's "Refs:" line, which surfaces branches / HEAD / remote-
-// tracking refs only. Tag refs render in the dedicated "Tags:" block
-// (which also includes annotated-tag messages).
-func nonTagRefs(refs []string) []string { return visibleRefs(refs) }
-
 // formatRefs builds a "(ref1, ref2, ...)" decoration block. Returns
 // the styled string (with per-kind colors) and the matching plain
 // string. Both strings have identical character content so callers can
@@ -2103,44 +2060,7 @@ func renderLogPanel(m model, w, h int, active bool) string {
 // panel — metadata block followed by a blank separator and the body —
 // without applying any scroll offset.
 func messageLines(d gitcmd.CommitDetail) []string {
-	if d.SHA == "" {
-		return nil
-	}
-	lines := []string{
-		"commit " + d.SHA,
-		"Author:     " + d.AuthorName + " <" + d.AuthorEmail + ">",
-		"AuthorDate: " + d.AuthorDateISO + "  (" + d.AuthorDateRel + ")",
-		"Commit:     " + d.CommitterName + " <" + d.CommitterEmail + ">",
-		"CommitDate: " + d.CommitterDateISO + "  (" + d.CommitterDateRel + ")",
-	}
-	if len(d.Parents) > 0 {
-		lines = append(lines, "Parents:    "+strings.Join(d.Parents, " "))
-	}
-	if nonTag := nonTagRefs(d.Refs); len(nonTag) > 0 {
-		lines = append(lines, "Refs:       "+strings.Join(nonTag, ", "))
-	}
-	for i, t := range d.Tags {
-		label := "Tags:       "
-		if i > 0 {
-			label = "            "
-		}
-		name := t.Name
-		if t.Annotated {
-			name += " (annotated)"
-		}
-		lines = append(lines, label+name)
-		if t.Annotated && t.Message != "" {
-			for _, ml := range strings.Split(t.Message, "\n") {
-				lines = append(lines, "              "+ml)
-			}
-		}
-	}
-	lines = append(lines, "")
-	body := d.Body
-	if body != "" {
-		lines = append(lines, strings.Split(body, "\n")...)
-	}
-	return lines
+	return metadata.Lines(d, time.Local)
 }
 
 // messageLineCount returns the total renderable line count for the
@@ -2152,28 +2072,68 @@ var (
 	msgSHAStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
-// styleMessageLine applies dim coloring to header label prefixes
-// ("Author:", "AuthorDate:", etc.) and accent coloring to the commit
-// sha row, so metadata is visually separable from the message body.
-func styleMessageLine(line string) string {
-	if strings.HasPrefix(line, "commit ") {
-		return msgLabelStyle.Render("commit ") + msgSHAStyle.Render(line[len("commit "):])
+// styleMessageLine applies dim coloring to the Tags: label, accent
+// coloring to the short sha on the first metadata line, and per-kind
+// coloring to the refs in parens that follow it. line is the
+// (already padded/truncated) plain string; shortSHA identifies the
+// first metadata line.
+func styleMessageLine(line, shortSHA string) string {
+	if shortSHA != "" && (line == shortSHA || strings.HasPrefix(line, shortSHA+" ") || strings.HasPrefix(line, shortSHA+"…")) {
+		return styleSHARefsLine(line, shortSHA)
 	}
-	for _, label := range []string{"Author:", "AuthorDate:", "Commit:", "CommitDate:", "Parents:", "Refs:", "Tags:"} {
-		prefix := label
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-		// Header label rows are padded to a fixed column ("Label:     ")
-		// — find the run of spaces after the label so the colored
-		// prefix includes that padding.
-		end := len(prefix)
+	if strings.HasPrefix(line, "Tags:") {
+		end := len("Tags:")
 		for end < len(line) && line[end] == ' ' {
 			end++
 		}
 		return msgLabelStyle.Render(line[:end]) + line[end:]
 	}
 	return line
+}
+
+// styleSHARefsLine colors the leading short sha and the parenthesised
+// refs that may follow it. Operates on the padded/truncated plain
+// string, so missing closing ')' (from truncation) is tolerated.
+func styleSHARefsLine(line, shortSHA string) string {
+	rest := strings.TrimPrefix(line, shortSHA)
+	out := msgSHAStyle.Render(shortSHA)
+	// Locate the opening paren that begins the refs block, if any.
+	open := strings.Index(rest, "(")
+	if open == -1 {
+		return out + rest
+	}
+	out += rest[:open]
+	inside := rest[open+1:]
+	// Find a closing ')' in what remains; absent when truncated.
+	closeIdx := strings.LastIndex(inside, ")")
+	var refsStr, suffix string
+	if closeIdx == -1 {
+		refsStr = inside
+		suffix = ""
+	} else {
+		refsStr = inside[:closeIdx]
+		suffix = inside[closeIdx:]
+	}
+	out += refParenStyle.Render("(")
+	for i, name := range strings.Split(refsStr, ", ") {
+		if i > 0 {
+			out += refParenStyle.Render(", ")
+		}
+		var style lipgloss.Style
+		switch gitcmd.ClassifyRef(name) {
+		case gitcmd.RefRemote:
+			style = refRemoteStyle
+		case gitcmd.RefHEAD:
+			style = refHEADStyle
+		default:
+			style = refLocalStyle
+		}
+		out += style.Render(name)
+	}
+	if suffix != "" {
+		out += refParenStyle.Render(")") + suffix[1:]
+	}
+	return out
 }
 
 // renderMessagePanel renders the top-right message panel using the
@@ -2216,7 +2176,7 @@ func renderMessagePanel(m model, w, h int, active, stale bool) string {
 		if stale {
 			lines = append(lines, staleStyle.Render(truncated))
 		} else {
-			lines = append(lines, styleMessageLine(truncated))
+			lines = append(lines, styleMessageLine(truncated, m.detail.ShortSHA))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -2456,7 +2416,7 @@ func (m model) View() string {
 	if m.w == 0 || m.h == 0 {
 		return ""
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := layout.Compute(m.w, m.h, len(m.files))
 	if lo.TooSmall {
 		msg := fmt.Sprintf("Terminal too small (need ≥%dx%d)", layout.MinCols, layout.MinRows)
 		body := msg + "\n" + tooSmallHintStyle.Render("q to quit")
@@ -2466,29 +2426,24 @@ func (m model) View() string {
 	topActive := m.active == sectionTop
 	botActive := m.active == sectionBottom
 
-	var base string
+	var topRow string
 	if lo.SmallMode {
-		var topPanel, bottomPanel string
 		if m.topShowRight {
-			topPanel = renderMessagePanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive, m.detailLoading)
+			topRow = renderMessagePanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive, m.detailLoading)
 		} else {
-			topPanel = renderLogPanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive)
+			topRow = renderLogPanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive)
 		}
-		if m.bottomShowRight {
-			bottomPanel = renderDiffPanel(m, lo.BottomLeft.W, lo.BottomLeft.H, botActive, m.diffLoading)
-		} else {
-			bottomPanel = renderFilesPanel(m, lo.BottomLeft.W, lo.BottomLeft.H, botActive, m.filesLoading)
-		}
-		base = topPanel + "\n" + bottomPanel + "\n" + m.renderStatus(lo.Status.W)
 	} else {
 		topLeft := renderLogPanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive)
-		bottomLeft := renderFilesPanel(m, lo.BottomLeft.W, lo.BottomLeft.H, botActive, m.filesLoading)
 		topRight := renderMessagePanel(m, lo.TopRight.W, lo.TopRight.H, topActive, m.detailLoading)
-		bottomRight := renderDiffPanel(m, lo.BottomRight.W, lo.BottomRight.H, botActive, m.diffLoading)
-		topRow := lipgloss.JoinHorizontal(lipgloss.Top, topLeft, topRight)
-		bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, bottomLeft, bottomRight)
-		base = strings.Join([]string{topRow, bottomRow, m.renderStatus(lo.Status.W)}, "\n")
+		// 1-column vertical gap between the log and message panels.
+		hGap := strings.Repeat(" \n", lo.TopLeft.H-1) + " "
+		topRow = lipgloss.JoinHorizontal(lipgloss.Top, topLeft, hGap, topRight)
 	}
+	filesPanel := renderFilesPanel(m, lo.Files.W, lo.Files.H, botActive, m.filesLoading)
+	diffPanel := renderDiffPanel(m, lo.Diff.W, lo.Diff.H, botActive, m.diffLoading)
+	vGap := strings.Repeat(" ", m.w)
+	base := strings.Join([]string{topRow, vGap, filesPanel, vGap, diffPanel, m.renderStatus(lo.Status.W)}, "\n")
 
 	if m.helpModalOpen {
 		return overlayCentered(base, renderHelpModal(), m.w, m.h)
@@ -2517,7 +2472,7 @@ func renderHelpModal() string {
 			{"q / esc", "back (files → commits → quit; closes overlays)"},
 			{"ctrl+c", "quit"},
 			{"tab", "toggle between top and bottom section"},
-			{"enter", "activate bottom section (small mode: swap to right panel)"},
+			{"enter", "activate bottom section (small mode: swap top row to message)"},
 			{"w", "switch worktree"},
 			{"ctrl+r", "refresh (re-read log, drop caches)"},
 		}},
