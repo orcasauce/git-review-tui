@@ -8,7 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -644,22 +646,25 @@ func (c *Client) Worktrees(ctx context.Context) ([]Worktree, error) {
 		return nil, &Error{Op: "worktree list --porcelain", Err: err, Stderr: stderr.String()}
 	}
 	wts := parseWorktrees(stdout.String())
-	want := filepathClean(c.workTreePath)
+	want := canonicalPath(c.workTreePath)
 	for i := range wts {
-		if filepathClean(wts[i].Path) == want {
+		if canonicalPath(wts[i].Path) == want {
 			wts[i].Current = true
 		}
 	}
 	return wts, nil
 }
 
-// filepathClean is a tiny shim so this file can avoid importing
-// path/filepath just for one call.
-func filepathClean(p string) string {
-	// Trim a single trailing slash if present; git emits absolute paths
-	// already in a clean form, so heavier normalization is unnecessary.
+// canonicalPath returns a path comparison key: symlinks resolved when
+// possible (so macOS /tmp vs /private/tmp matches), trailing slash
+// stripped, and falls back to the original string when EvalSymlinks
+// fails (e.g. a worktree that no longer exists on disk).
+func canonicalPath(p string) string {
 	if len(p) > 1 && p[len(p)-1] == '/' {
-		return p[:len(p)-1]
+		p = p[:len(p)-1]
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
 	}
 	return p
 }
@@ -701,6 +706,491 @@ func parseWorktrees(out string) []Worktree {
 	}
 	flush()
 	return result
+}
+
+// IsMerge reports whether sha names a merge commit (two or more
+// parents). The check is a thin wrapper around
+// `git rev-list --no-walk --merges <sha>`, which prints sha when it is
+// a merge and nothing otherwise. A non-existent or malformed SHA
+// produces a wrapped *Error.
+func (c *Client) IsMerge(ctx context.Context, sha string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rev-list", "--no-walk", "--merges", sha,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, &Error{Op: "rev-list --no-walk --merges " + sha, Err: err, Stderr: stderr.String()}
+	}
+	return strings.TrimSpace(stdout.String()) != "", nil
+}
+
+// IsRootCommit reports whether sha is the repository's root commit
+// (has no parents). Implementation runs
+// `git rev-list --parents -n 1 <sha>` and checks that the single output
+// line carries exactly one token (the sha itself, with no parents).
+func (c *Client) IsRootCommit(ctx context.Context, sha string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rev-list", "--parents", "-n", "1", sha,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, &Error{Op: "rev-list --parents -n 1 " + sha, Err: err, Stderr: stderr.String()}
+	}
+	fields := strings.Fields(strings.TrimSpace(stdout.String()))
+	return len(fields) == 1, nil
+}
+
+// StatusInfo summarises the repository state needed to gate destructive
+// operations like rebase. Clean is true when there are no modified,
+// staged, or conflicted tracked files (untracked files are ignored).
+// HeadBranch is the short branch name HEAD points at, empty when HEAD
+// is detached. BranchCheckedOutAt is the path of another worktree that
+// also has HeadBranch checked out, empty when no such worktree exists.
+// UnmergedPaths lists the paths of files with conflict markers in the
+// index — populated mid-rebase / mid-merge.
+type StatusInfo struct {
+	Clean              bool
+	HeadBranch         string
+	BranchCheckedOutAt string
+	UnmergedPaths      []string
+}
+
+// Status reports current worktree state. The implementation issues
+// `git status --porcelain`, `git symbolic-ref HEAD`, and (when on a
+// branch) `git worktree list --porcelain` to assemble the result.
+func (c *Client) Status(ctx context.Context) (StatusInfo, error) {
+	var info StatusInfo
+	// Tracked-file dirty check + unmerged extraction.
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"status", "--porcelain", "--untracked-files=no",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return StatusInfo{}, &Error{Op: "status --porcelain", Err: err, Stderr: stderr.String()}
+	}
+	statusOut := stdout.String()
+	info.Clean = strings.TrimSpace(statusOut) == ""
+	for _, line := range strings.Split(statusOut, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		x, y := line[0], line[1]
+		// Unmerged combinations per git-status(1).
+		unmerged := (x == 'U' || y == 'U') ||
+			(x == 'A' && y == 'A') ||
+			(x == 'D' && y == 'D')
+		if unmerged {
+			info.UnmergedPaths = append(info.UnmergedPaths, strings.TrimSpace(line[3:]))
+		}
+	}
+	// HEAD branch / detached.
+	cmd = exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"symbolic-ref", "--short", "--quiet", "HEAD",
+	)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		info.HeadBranch = strings.TrimSpace(stdout.String())
+	} else {
+		var exitErr *exec.ExitError
+		if !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && stderr.Len() == 0) {
+			return StatusInfo{}, &Error{Op: "symbolic-ref HEAD", Err: err, Stderr: stderr.String()}
+		}
+		// Detached HEAD: leave HeadBranch empty.
+	}
+	// Branch-also-checked-out-elsewhere lookup.
+	if info.HeadBranch != "" {
+		wts, err := c.Worktrees(ctx)
+		if err != nil {
+			return StatusInfo{}, err
+		}
+		for _, w := range wts {
+			if !w.Current && w.Branch == info.HeadBranch {
+				info.BranchCheckedOutAt = w.Path
+				break
+			}
+		}
+	}
+	return info, nil
+}
+
+// CommitExists reports whether sha resolves to a reachable object in
+// the repository. Thin wrapper around `git cat-file -e <sha>`. Any
+// failure other than "object missing" is returned as a wrapped *Error.
+func (c *Client) CommitExists(ctx context.Context, sha string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"cat-file", "-e", sha,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, &Error{Op: "cat-file -e " + sha, Err: err, Stderr: stderr.String()}
+}
+
+// RebaseState identifies the post-invocation state of a rebase command.
+// RebaseDone means the rebase finished cleanly; RebaseHalted means the
+// rebase stopped (typically on a conflict) and the repo is in a
+// mid-rebase state requiring a follow-up (--continue / --abort);
+// RebaseError means git exited non-zero and the repo is NOT mid-rebase.
+type RebaseState int
+
+const (
+	// RebaseDone means git rebase exited zero and HEAD has advanced.
+	RebaseDone RebaseState = iota
+	// RebaseHalted means git rebase exited non-zero but left a mid-rebase
+	// state on disk (e.g. .git/rebase-merge/), typically due to a conflict.
+	RebaseHalted
+	// RebaseError means git rebase exited non-zero with no mid-rebase
+	// state — i.e. a generic failure that did not start, or rolled back.
+	RebaseError
+)
+
+// RebaseResult describes the outcome of a RebaseDropStart /
+// RebaseContinue invocation. The fields populated depend on State.
+type RebaseResult struct {
+	State           RebaseState
+	HaltSHA         string
+	HaltSubject     string
+	ConflictedPaths []string
+	Progress        string
+	Stderr          string
+}
+
+// RebaseDropStart runs `git rebase -i --rebase-merges <base>` with a
+// generated sequence-editor script that rewrites every `pick <sha>`
+// todo line whose SHA is in marked to `drop <sha>`. base is the parent
+// of the oldest marked commit (the commit with the lowest rev-list
+// count). The marked slice may be unordered; the function determines
+// the rebase base itself.
+//
+// On a clean completion the returned RebaseResult has State=RebaseDone.
+// On a conflict halt, State=RebaseHalted with HaltSHA, HaltSubject, and
+// ConflictedPaths populated. On any other failure, State=RebaseError
+// with Stderr populated.
+func (c *Client) RebaseDropStart(ctx context.Context, marked []string) (RebaseResult, error) {
+	if len(marked) == 0 {
+		return RebaseResult{}, errors.New("gitcmd.RebaseDropStart: empty marked set")
+	}
+	// Find the oldest marked sha: smallest `git rev-list --count <sha>`.
+	oldest := ""
+	minCount := -1
+	for _, sha := range marked {
+		out, err := c.revListCount(ctx, sha)
+		if err != nil {
+			return RebaseResult{}, err
+		}
+		if minCount < 0 || out < minCount {
+			minCount = out
+			oldest = sha
+		}
+	}
+	// Generate the sequence-editor shell script into a temp dir.
+	tmpdir, err := os.MkdirTemp("", "git-review-tui-rebase-")
+	if err != nil {
+		return RebaseResult{}, &Error{Op: "mkdir tempdir", Err: err}
+	}
+	defer os.RemoveAll(tmpdir)
+	scriptPath := filepath.Join(tmpdir, "sequence-editor.sh")
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	script.WriteString("todofile=\"$1\"\n")
+	script.WriteString("sed ")
+	for _, sha := range marked {
+		// Only `pick` lines whose first SHA token matches one of the
+		// marked SHAs are rewritten to `drop`. `--abbrev=40` below
+		// guarantees the todo lists full SHAs so this match is exact.
+		script.WriteString("-e 's/^pick " + sha + "/drop " + sha + "/' ")
+	}
+	script.WriteString("\"$todofile\" > \"$todofile.new\" && mv \"$todofile.new\" \"$todofile\"\n")
+	if err := os.WriteFile(scriptPath, []byte(script.String()), 0o755); err != nil {
+		return RebaseResult{}, &Error{Op: "write sequence editor", Err: err}
+	}
+	// Invoke git rebase with the generated script wired in as the
+	// sequence editor. `core.abbrev=40` forces full SHAs in the todo
+	// file. GIT_EDITOR=true ensures any unexpected editor prompt
+	// (e.g. a reword step) returns immediately rather than blocking.
+	base := oldest + "~1"
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"-c", "core.abbrev=40",
+		"-c", "sequence.editor="+scriptPath,
+		"rebase", "-i", "--rebase-merges", base,
+	)
+	cmd.Env = append(os.Environ(), "GIT_EDITOR=true")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	result := RebaseResult{Stderr: stderr.String()}
+	if runErr == nil {
+		result.State = RebaseDone
+		return result, nil
+	}
+	// Rebase exited non-zero. Distinguish halt (mid-rebase state on
+	// disk) from a generic error.
+	inProgress, _ := c.rebaseInProgress(ctx)
+	if !inProgress {
+		result.State = RebaseError
+		return result, nil
+	}
+	result.State = RebaseHalted
+	if haltSHA, _ := c.readStoppedSHA(ctx); haltSHA != "" {
+		result.HaltSHA = haltSHA
+		if subj, err := c.commitSubject(ctx, haltSHA); err == nil {
+			result.HaltSubject = subj
+		}
+	}
+	if info, err := c.Status(ctx); err == nil {
+		result.ConflictedPaths = info.UnmergedPaths
+	}
+	return result, nil
+}
+
+// ConflictSide picks which side of a conflict to take when resolving
+// in bulk via `git checkout --theirs|--ours`.
+type ConflictSide int
+
+const (
+	// SideTheirs takes the version from the commit being applied (the
+	// commit the interactive rebase halted on).
+	SideTheirs ConflictSide = iota
+	// SideOurs takes the version from the rebase base / accumulated
+	// reapply state.
+	SideOurs
+)
+
+// CheckoutSide resolves every path in paths to the given side and stages
+// the result. Concretely: runs `git checkout --theirs|--ours <paths...>`
+// followed by `git add <paths...>`. Used by the conflict popup's
+// [t] / [o] resolution handlers.
+func (c *Client) CheckoutSide(ctx context.Context, side ConflictSide, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	flag := "--theirs"
+	if side == SideOurs {
+		flag = "--ours"
+	}
+	args := append([]string{"-C", c.workTreePath, "checkout", flag, "--"}, paths...)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return &Error{Op: "checkout " + flag, Err: err, Stderr: stderr.String()}
+	}
+	addArgs := append([]string{"-C", c.workTreePath, "add", "--"}, paths...)
+	addCmd := exec.CommandContext(ctx, "git", addArgs...)
+	var addStderr bytes.Buffer
+	addCmd.Stderr = &addStderr
+	if err := addCmd.Run(); err != nil {
+		return &Error{Op: "add", Err: err, Stderr: addStderr.String()}
+	}
+	return nil
+}
+
+// RebaseContinue runs `git rebase --continue` and reports the resulting
+// state with the same RebaseResult semantics as RebaseDropStart: Done
+// when the rebase completed, Halted when it stopped on another conflict,
+// Error when it bailed out without leaving a mid-rebase state.
+func (c *Client) RebaseContinue(ctx context.Context) (RebaseResult, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"-c", "core.abbrev=40",
+		"rebase", "--continue",
+	)
+	// GIT_EDITOR=true short-circuits any commit-message editor prompt
+	// `rebase --continue` might want to open (e.g. for a reworded commit
+	// or a commit-message edit step), so the call never blocks.
+	cmd.Env = append(os.Environ(), "GIT_EDITOR=true")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	result := RebaseResult{Stderr: stderr.String()}
+	if runErr == nil {
+		result.State = RebaseDone
+		return result, nil
+	}
+	inProgress, _ := c.rebaseInProgress(ctx)
+	if !inProgress {
+		result.State = RebaseError
+		return result, nil
+	}
+	result.State = RebaseHalted
+	if haltSHA, _ := c.readStoppedSHA(ctx); haltSHA != "" {
+		result.HaltSHA = haltSHA
+		if subj, err := c.commitSubject(ctx, haltSHA); err == nil {
+			result.HaltSubject = subj
+		}
+	}
+	if info, err := c.Status(ctx); err == nil {
+		result.ConflictedPaths = info.UnmergedPaths
+	}
+	return result, nil
+}
+
+// RebaseAbort runs `git rebase --abort` when a rebase is in progress,
+// no-op (returns nil) otherwise. Used both for explicit cancellation
+// (esc on the blocking modal) and for auto-rollback on rebase errors.
+func (c *Client) RebaseAbort(ctx context.Context) error {
+	inProgress, err := c.rebaseInProgress(ctx)
+	if err != nil {
+		return err
+	}
+	if !inProgress {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rebase", "--abort",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return &Error{Op: "rebase --abort", Err: err, Stderr: stderr.String()}
+	}
+	return nil
+}
+
+// rebaseInProgress reports whether the repository currently has a
+// mid-rebase state on disk (either `.git/rebase-merge/` for interactive
+// rebases or `.git/rebase-apply/` for am-style rebases).
+func (c *Client) rebaseInProgress(ctx context.Context) (bool, error) {
+	for _, name := range []string{"rebase-merge", "rebase-apply"} {
+		p, err := c.gitPath(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// gitPath returns the absolute path of a file inside the .git
+// directory, resolving the path relative to the worktree when git
+// returns a relative one. Used for direct filesystem inspection of
+// rebase state files.
+func (c *Client) gitPath(ctx context.Context, name string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rev-parse", "--git-path", name,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", &Error{Op: "rev-parse --git-path " + name, Err: err, Stderr: stderr.String()}
+	}
+	p := strings.TrimSpace(stdout.String())
+	if p == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(c.workTreePath, p)
+	}
+	return p, nil
+}
+
+// revListCount returns `git rev-list --count <sha>` — the number of
+// commits reachable from sha (inclusive). The oldest commit in any
+// linear-ish set has the smallest count.
+func (c *Client) revListCount(ctx context.Context, sha string) (int, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rev-list", "--count", sha,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return 0, &Error{Op: "rev-list --count " + sha, Err: err, Stderr: stderr.String()}
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
+	if err != nil {
+		return 0, &Error{Op: "rev-list --count " + sha, Err: err}
+	}
+	return n, nil
+}
+
+// readStoppedSHA returns the SHA recorded in
+// `.git/rebase-merge/stopped-sha` (the commit the interactive rebase
+// halted on). Returns empty string with no error when the file is
+// absent.
+func (c *Client) readStoppedSHA(ctx context.Context) (string, error) {
+	p, err := c.gitPath(ctx, "rebase-merge/stopped-sha")
+	if err != nil {
+		return "", err
+	}
+	if p == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		// Missing file is not an error — the rebase may not have
+		// recorded a stopped-sha yet (e.g. halt before the first pick).
+		return "", nil
+	}
+	// stopped-sha is sometimes abbreviated; expand to full sha when
+	// possible so callers always see a 40-hex SHA.
+	short := strings.TrimSpace(string(b))
+	if short == "" {
+		return "", nil
+	}
+	if len(short) == 40 {
+		return short, nil
+	}
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"rev-parse", short,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return short, nil
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// commitSubject returns the subject line of sha.
+func (c *Client) commitSubject(ctx context.Context, sha string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"show", "-s", "--format=%s", sha,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", &Error{Op: "show -s --format=%s " + sha, Err: err, Stderr: stderr.String()}
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // Error wraps a git invocation failure with the command summary and

@@ -32,6 +32,16 @@ const (
 	sectionBottom
 )
 
+// ActionKind is the kind of pending action queued against a commit.
+// The enum is shaped so future action types (squash, reword, edit) can
+// be added without changing the model field's shape.
+type ActionKind int
+
+const (
+	// ActionDrop marks a commit to be removed by an interactive rebase.
+	ActionDrop ActionKind = iota + 1
+)
+
 // logPageSize is the number of commits fetched per call to gitcmd.Log.
 // loadMoreThreshold is how close to the end of the loaded list the
 // selection may get before we kick off another page.
@@ -192,16 +202,63 @@ type model struct {
 	// to a different commit now.
 	pendingRefreshSHA  string
 	pendingRefreshPath string
+
+	// pendingActions queues per-commit actions staged via ctrl+d (and,
+	// in later slices, additional action keys). The leftmost action
+	// column appears in the log panel only when this map is non-empty.
+	// Entries survive ctrl+r refresh (with vanished SHAs pruned) and
+	// are cleared on worktree switch.
+	pendingActions map[string]ActionKind
+
+	// Rebase state machine. Exactly one of the popups is up at a time;
+	// rebaseState identifies which. Idle means no rebase UI is active.
+	rebaseState     rebaseUIState
+	rebaseRefuseMsg string
+	// rebaseSnapshot is the set of SHAs marked for drop at the moment
+	// ctrl+s was confirmed. Used to compute the post-success cursor
+	// anchor and to know which marks to clear on success.
+	rebaseSnapshot []string
+	// rebaseAnchorSHA is the closest unmarked SHA below (older than) the
+	// dropped range at confirm time. The post-rebase refresh restores
+	// the cursor onto this SHA via the existing pendingRefreshSHA path.
+	rebaseAnchorSHA string
+	// rebaseCancel cancels the in-flight rebase context when esc is
+	// pressed on the blocking modal. Cleared once the goroutine returns.
+	rebaseCancel context.CancelFunc
+	// rebaseHalt holds the most recent RebaseHalted result while the
+	// conflict popup is up. Drives the popup's header and conflicted-path
+	// list.
+	rebaseHalt gitcmd.RebaseResult
+	// rebaseManualUnmerged is populated when the manual-resolve OK button
+	// is pressed while unmerged paths remain. Renders the list in the
+	// popup so the user knows exactly what is still unresolved.
+	rebaseManualUnmerged []string
 }
+
+// rebaseUIState tracks which rebase popup is currently up. Most
+// rebase-state transitions are driven by tea.Msg deliveries from the
+// rebase goroutine; key handlers intercept input while one of these
+// states is non-idle.
+type rebaseUIState int
+
+const (
+	rebaseStateIdle rebaseUIState = iota
+	rebaseStateSummary
+	rebaseStateRunning
+	rebaseStateRefuse
+	rebaseStateConflict
+	rebaseStateManualWait
+)
 
 func initialModel(git *gitcmd.Client, branch, worktreeLabel string) model {
 	ldr := loader.New(loader.Config{Source: git})
 	return model{
-		active:        sectionTop,
-		git:           git,
-		ldr:           ldr,
-		branch:        branch,
-		worktreeLabel: worktreeLabel,
+		active:         sectionTop,
+		git:            git,
+		ldr:            ldr,
+		branch:         branch,
+		worktreeLabel:  worktreeLabel,
+		pendingActions: map[string]ActionKind{},
 	}
 }
 
@@ -265,6 +322,16 @@ func (m *model) clearError() {
 // errClearMsg.
 type statusClearMsg struct {
 	at time.Time
+}
+
+// rebaseDoneMsg delivers the outcome of a RebaseDropStart goroutine
+// back to Update. cancelled is set when the rebase context was cancelled
+// (esc on the blocking modal); err is set for unexpected gitcmd-level
+// failures. Otherwise result.State distinguishes done / halted / error.
+type rebaseDoneMsg struct {
+	result    gitcmd.RebaseResult
+	cancelled bool
+	err       error
 }
 
 // raiseStatus shows a transient non-error message in the status row
@@ -363,6 +430,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// duplicating rows; the loader will re-request the right offset.
 		if len(msg.commits) < logPageSize {
 			m.loadedAll = true
+		}
+		// On a first-page replacement (refresh or initial load), prune
+		// pending-action marks to commits that still exist. Vanished SHAs
+		// are silently dropped; no status message.
+		if msg.skip == 0 && len(m.pendingActions) > 0 {
+			present := make(map[string]struct{}, len(m.commits))
+			for _, c := range m.commits {
+				present[c.SHA] = struct{}{}
+			}
+			for sha := range m.pendingActions {
+				if _, ok := present[sha]; !ok {
+					delete(m.pendingActions, sha)
+				}
+			}
 		}
 		// Restore a refresh-preserved commit selection by sha if it
 		// still exists in the new log. Only apply on the first page
@@ -537,6 +618,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case rebaseDoneMsg:
+		return m.handleRebaseDone(msg)
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
@@ -563,6 +647,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// key routing only kicks in when the modal is closed.
 		if m.wtModalOpen {
 			return m.updateWorktreeModal(keyStr)
+		}
+		// Rebase popups intercept all keys while any of them is up.
+		if m.rebaseState != rebaseStateIdle {
+			return m.updateRebasePopup(keyStr)
 		}
 		// The commit-search prompt likewise consumes every keystroke
 		// while it is open. `n`/`N` are handled below (after confirmation)
@@ -760,13 +848,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "ctrl+d":
 			if m.active == sectionTop {
-				m.pageMessage(1)
-				return m, nil
+				return m, m.toggleDropMark()
 			}
 			if m.active == sectionBottom {
 				m.jumpDiffNextHunk()
 				return m, nil
 			}
+		case "ctrl+s":
+			return m.startSave()
 		case "ctrl+u":
 			if m.active == sectionTop {
 				m.pageMessage(-1)
@@ -779,6 +868,426 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// toggleDropMark flips an ActionDrop entry on the currently-selected
+// commit's pending-actions map. Refused (with a status-row message)
+// when the commit is a merge or the repo's root commit. The merge /
+// root checks run synchronously against gitcmd; both shell out to a
+// short rev-list call and are bounded by a 2-second context.
+func (m *model) toggleDropMark() tea.Cmd {
+	if len(m.commits) == 0 {
+		return nil
+	}
+	if m.selectedIdx < 0 || m.selectedIdx >= len(m.commits) {
+		return nil
+	}
+	sha := m.commits[m.selectedIdx].SHA
+	if m.pendingActions == nil {
+		m.pendingActions = map[string]ActionKind{}
+	}
+	if _, ok := m.pendingActions[sha]; ok {
+		delete(m.pendingActions, sha)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	isMerge, err := m.git.IsMerge(ctx, sha)
+	if err != nil {
+		return m.raiseError(err)
+	}
+	if isMerge {
+		return m.raiseStatus("Cannot drop merge commits (yet)")
+	}
+	isRoot, err := m.git.IsRootCommit(ctx, sha)
+	if err != nil {
+		return m.raiseError(err)
+	}
+	if isRoot {
+		return m.raiseStatus("Cannot drop the root commit")
+	}
+	m.pendingActions[sha] = ActionDrop
+	return nil
+}
+
+// startSave is the ctrl+s entry point. With zero marks it flashes
+// `No pending actions` in the status row. Otherwise it runs the full
+// precondition battery and either opens the refuse popup with an
+// actionable message or the action-summary popup. The actual rebase
+// is launched only after the user confirms the summary popup (see
+// confirmRebase below).
+func (m model) startSave() (tea.Model, tea.Cmd) {
+	if len(m.pendingActions) == 0 {
+		return m, m.raiseStatus("No pending actions")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := m.git.Status(ctx)
+	if err != nil {
+		return m, m.raiseError(err)
+	}
+	switch {
+	case !info.Clean:
+		m.rebaseRefuseMsg = "Worktree has uncommitted changes — commit or stash first"
+		m.rebaseState = rebaseStateRefuse
+		return m, nil
+	case info.HeadBranch == "":
+		m.rebaseRefuseMsg = "HEAD is detached — checkout a branch first"
+		m.rebaseState = rebaseStateRefuse
+		return m, nil
+	case info.BranchCheckedOutAt != "":
+		m.rebaseRefuseMsg = fmt.Sprintf("Branch %s is also checked out in %s", info.HeadBranch, info.BranchCheckedOutAt)
+		m.rebaseState = rebaseStateRefuse
+		return m, nil
+	}
+	// Stale-mark check: every marked SHA must still resolve.
+	missing := 0
+	for sha := range m.pendingActions {
+		ok, err := m.git.CommitExists(ctx, sha)
+		if err != nil {
+			return m, m.raiseError(err)
+		}
+		if !ok {
+			missing++
+		}
+	}
+	if missing > 0 {
+		m.rebaseRefuseMsg = fmt.Sprintf("%d marked commit%s no longer exist — refresh first",
+			missing, plural2(missing))
+		m.rebaseState = rebaseStateRefuse
+		return m, nil
+	}
+	m.rebaseState = rebaseStateSummary
+	return m, nil
+}
+
+// plural2 returns "" for n==1 and "s" otherwise. Used for messages like
+// "N commits".
+func plural2(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// updateRebasePopup handles every keystroke while a rebase popup
+// (summary, running, or refuse) is up. The PRD's "popups intercept
+// all key input" rule is enforced by returning unconditionally without
+// falling through to the panel keybindings.
+func (m model) updateRebasePopup(keyStr string) (tea.Model, tea.Cmd) {
+	switch m.rebaseState {
+	case rebaseStateRefuse:
+		switch keyStr {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "q", "enter":
+			m.rebaseState = rebaseStateIdle
+			m.rebaseRefuseMsg = ""
+			return m, nil
+		}
+		return m, nil
+	case rebaseStateSummary:
+		switch keyStr {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "q":
+			m.rebaseState = rebaseStateIdle
+			return m, nil
+		case "enter":
+			return m.confirmRebase()
+		}
+		return m, nil
+	case rebaseStateRunning:
+		switch keyStr {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			if m.rebaseCancel != nil {
+				m.rebaseCancel()
+			}
+			return m, nil
+		}
+		return m, nil
+	case rebaseStateConflict:
+		switch keyStr {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "a":
+			return m.conflictAbort()
+		case "t":
+			return m.conflictResolveSide(gitcmd.SideTheirs)
+		case "o":
+			return m.conflictResolveSide(gitcmd.SideOurs)
+		case "m":
+			return m.conflictManualResolve()
+		}
+		return m, nil
+	case rebaseStateManualWait:
+		switch keyStr {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "enter":
+			return m.manualWaitOK()
+		case "esc", "q":
+			// Back to the conflict popup so the user can pick a different
+			// strategy without losing whatever staging they've already done.
+			m.rebaseState = rebaseStateConflict
+			m.rebaseManualUnmerged = nil
+			return m, nil
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// conflictManualResolve handles [m] on the conflict popup: hands control
+// to the user to resolve the conflict in another terminal. The popup
+// switches to a waiting state with an OK button; the rebase is left
+// in its halted state on disk.
+func (m model) conflictManualResolve() (tea.Model, tea.Cmd) {
+	m.rebaseState = rebaseStateManualWait
+	m.rebaseManualUnmerged = nil
+	return m, nil
+}
+
+// manualWaitOK runs the precheck for the [OK] button on the manual-wait
+// popup. If `git status` still reports unmerged paths, the popup stays
+// up and lists them. Otherwise the rebase continues via the existing
+// goroutine + rebaseDoneMsg routing.
+func (m model) manualWaitOK() (tea.Model, tea.Cmd) {
+	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	info, err := m.git.Status(statusCtx)
+	if err != nil {
+		return m, m.raiseError(err)
+	}
+	if len(info.UnmergedPaths) > 0 {
+		m.rebaseManualUnmerged = info.UnmergedPaths
+		return m, nil
+	}
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseManualUnmerged = nil
+	m.rebaseState = rebaseStateRunning
+	ctx, cancelRun := context.WithCancel(context.Background())
+	m.rebaseCancel = cancelRun
+	return m, m.runRebaseContinueAfterManualCmd(ctx)
+}
+
+// runRebaseContinueAfterManualCmd runs RebaseContinue in a goroutine
+// and posts the outcome as a rebaseDoneMsg. Unlike runRebaseContinueCmd,
+// no CheckoutSide step is needed — the user has already staged their
+// resolution from another terminal.
+func (m model) runRebaseContinueAfterManualCmd(ctx context.Context) tea.Cmd {
+	git := m.git
+	return func() tea.Msg {
+		res, err := git.RebaseContinue(ctx)
+		if ctx.Err() != nil {
+			return rebaseDoneMsg{cancelled: true}
+		}
+		return rebaseDoneMsg{result: res, err: err}
+	}
+}
+
+// conflictAbort handles the [a] button on the conflict popup: runs
+// `git rebase --abort`, preserves the mark set, and surfaces a status
+// message confirming the repo is back to its pre-rebase state.
+func (m model) conflictAbort() (tea.Model, tea.Cmd) {
+	abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = m.git.RebaseAbort(abortCtx)
+	m.rebaseState = rebaseStateIdle
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseManualUnmerged = nil
+	m.rebaseSnapshot = nil
+	m.rebaseAnchorSHA = ""
+	return m, m.raiseStatus("Drop cancelled — repo unchanged")
+}
+
+// conflictResolveSide handles [t] / [o] on the conflict popup: stages
+// every conflicted path to the chosen side and kicks off `git rebase
+// --continue`. The blocking modal returns until the next halt or
+// completion.
+func (m model) conflictResolveSide(side gitcmd.ConflictSide) (tea.Model, tea.Cmd) {
+	paths := append([]string(nil), m.rebaseHalt.ConflictedPaths...)
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseState = rebaseStateRunning
+	ctx, cancel := context.WithCancel(context.Background())
+	m.rebaseCancel = cancel
+	return m, m.runRebaseContinueCmd(ctx, side, paths)
+}
+
+// runRebaseContinueCmd stages the conflict resolution then invokes
+// RebaseContinue, posting the resulting RebaseResult back to Update as
+// a rebaseDoneMsg. Same context-cancellation semantics as the initial
+// rebase goroutine.
+func (m model) runRebaseContinueCmd(ctx context.Context, side gitcmd.ConflictSide, paths []string) tea.Cmd {
+	git := m.git
+	return func() tea.Msg {
+		if err := git.CheckoutSide(ctx, side, paths); err != nil {
+			if ctx.Err() != nil {
+				return rebaseDoneMsg{cancelled: true}
+			}
+			return rebaseDoneMsg{err: err}
+		}
+		res, err := git.RebaseContinue(ctx)
+		if ctx.Err() != nil {
+			return rebaseDoneMsg{cancelled: true}
+		}
+		return rebaseDoneMsg{result: res, err: err}
+	}
+}
+
+// confirmRebase is called when the user presses enter on the action
+// summary popup. It snapshots the current mark set, computes the
+// post-success cursor anchor (closest unmarked SHA below the dropped
+// range), transitions to the blocking modal, and launches the rebase
+// goroutine.
+func (m model) confirmRebase() (tea.Model, tea.Cmd) {
+	snapshot := make([]string, 0, len(m.pendingActions))
+	for sha := range m.pendingActions {
+		snapshot = append(snapshot, sha)
+	}
+	m.rebaseSnapshot = snapshot
+	// Anchor: starting from the selected index, walk increasing index
+	// (older direction) until we find an unmarked SHA. That SHA is
+	// older than the oldest drop and is therefore preserved by the
+	// rebase, so the existing pendingRefreshSHA mechanism can land
+	// the cursor onto it after the post-rebase log refresh.
+	anchor := ""
+	for i := m.selectedIdx; i < len(m.commits); i++ {
+		if _, marked := m.pendingActions[m.commits[i].SHA]; !marked {
+			anchor = m.commits[i].SHA
+			break
+		}
+	}
+	m.rebaseAnchorSHA = anchor
+	m.rebaseState = rebaseStateRunning
+	ctx, cancel := context.WithCancel(context.Background())
+	m.rebaseCancel = cancel
+	return m, m.runRebaseCmd(ctx, snapshot)
+}
+
+// runRebaseCmd returns a tea.Cmd that runs RebaseDropStart in a
+// goroutine and posts the outcome as a rebaseDoneMsg. The context's
+// Err is checked after the call so callers can distinguish a user
+// cancellation (esc) from a generic rebase failure.
+func (m model) runRebaseCmd(ctx context.Context, marked []string) tea.Cmd {
+	git := m.git
+	return func() tea.Msg {
+		res, err := git.RebaseDropStart(ctx, marked)
+		if ctx.Err() != nil {
+			return rebaseDoneMsg{cancelled: true}
+		}
+		return rebaseDoneMsg{result: res, err: err}
+	}
+}
+
+// handleRebaseDone routes the rebase outcome: success clears marks
+// and refreshes the log with the cursor restored to the anchor SHA;
+// failure / halt / cancellation runs `git rebase --abort` (idempotent),
+// preserves marks, and surfaces an appropriate status-row message.
+func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
+	if m.rebaseCancel != nil {
+		m.rebaseCancel()
+		m.rebaseCancel = nil
+	}
+	m.rebaseState = rebaseStateIdle
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseManualUnmerged = nil
+
+	// User cancellation via esc: always abort any mid-rebase state.
+	if msg.cancelled {
+		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = m.git.RebaseAbort(abortCtx)
+		return m, m.raiseStatus("Drop cancelled — repo unchanged")
+	}
+	// Unexpected gitcmd-level failure (e.g. cannot fork sed). Auto-
+	// abort defensively and surface the underlying error.
+	if msg.err != nil {
+		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = m.git.RebaseAbort(abortCtx)
+		return m, m.raiseError(msg.err)
+	}
+	switch msg.result.State {
+	case gitcmd.RebaseDone:
+		// Success: clear the just-dropped marks, restore cursor onto
+		// the anchor, refresh the log so the new HEAD is reflected.
+		dropped := len(m.rebaseSnapshot)
+		for _, sha := range m.rebaseSnapshot {
+			delete(m.pendingActions, sha)
+		}
+		m.rebaseSnapshot = nil
+		anchor := m.rebaseAnchorSHA
+		m.rebaseAnchorSHA = ""
+		ldr := m.ldr
+		if ldr != nil {
+			ldr.CancelDetail()
+			ldr.CancelNumStat()
+			ldr.CancelDiff()
+		}
+		m.pendingRefreshSHA = anchor
+		m.pendingRefreshPath = ""
+		m.ldr = loader.New(loader.Config{Source: m.git})
+		m.commits = nil
+		m.selectedIdx = 0
+		m.viewportTop = 0
+		m.loadedAll = false
+		m.loadingMore = false
+		m.detail = gitcmd.CommitDetail{}
+		m.detailSHA = ""
+		m.msgScroll = 0
+		m.files = nil
+		m.filesSHA = ""
+		m.filesSelectedIdx = 0
+		m.filesViewportTop = 0
+		m.diff = diffrender.Result{}
+		m.diffSHA = ""
+		m.diffPath = ""
+		m.diffScroll = 0
+		m.diffHScroll = 0
+		m.detailLoading = false
+		m.filesLoading = false
+		m.diffLoading = false
+		m.resetBinarySize()
+		flash := fmt.Sprintf("Dropped %d commit%s", dropped, plural2(dropped))
+		return m, tea.Batch(m.loadLogCmd(0), m.raiseStatus(flash))
+	case gitcmd.RebaseHalted:
+		// Open the conflict popup with the halt info. The user picks a
+		// resolution strategy ([a] abort, [t] theirs, [o] ours) which
+		// either aborts the rebase or stages + continues it. Each halt
+		// gets its own fresh popup — no sticky strategy across halts.
+		m.rebaseHalt = msg.result
+		m.rebaseState = rebaseStateConflict
+		return m, nil
+	default:
+		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = m.git.RebaseAbort(abortCtx)
+		summary := summariseStderr(msg.result.Stderr)
+		if summary == "" {
+			summary = "unknown rebase error"
+		}
+		return m, m.raiseError(fmt.Errorf("Drop failed: %s", summary))
+	}
+}
+
+// summariseStderr extracts the first non-blank non-hint line from git's
+// stderr — typically the "fatal:" / "error:" line that explains the
+// failure best.
+func summariseStderr(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "hint:") {
+			continue
+		}
+		return l
+	}
+	return ""
 }
 
 // openSearchPrompt opens the commit-list fuzzy search prompt. The
@@ -1143,6 +1652,20 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 
 	m.topShowRight = false
 
+	// Pending action marks belong to a specific repository state. Switching
+	// worktrees discards them entirely.
+	m.pendingActions = map[string]ActionKind{}
+	if m.rebaseCancel != nil {
+		m.rebaseCancel()
+		m.rebaseCancel = nil
+	}
+	m.rebaseState = rebaseStateIdle
+	m.rebaseRefuseMsg = ""
+	m.rebaseSnapshot = nil
+	m.rebaseAnchorSHA = ""
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseManualUnmerged = nil
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	branch, label := resolveWorktreeLabel(ctx, newGit)
@@ -1391,6 +1914,9 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.helpModalOpen || m.wtModalOpen || m.searchActive || m.fileSearchActive {
+		return m, nil
+	}
+	if m.rebaseState != rebaseStateIdle {
 		return m, nil
 	}
 	switch msg.Button {
@@ -1737,6 +2263,12 @@ var (
 	relDateStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	authorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
 
+	// droppedActionStyle renders the `D` letter in the leftmost action
+	// column for commits marked for drop. droppedSubjectStyle is composed
+	// over the subject text on the same rows.
+	droppedActionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+	droppedSubjectStyle = lipgloss.NewStyle().Strikethrough(true).Faint(true)
+
 	// Ref-decoration colors on commit rows. HEAD is the brightest
 	// (cyan + bold), local branches are green, remote-tracking
 	// branches are red, and the surrounding parens / commas are dim.
@@ -1940,10 +2472,14 @@ func fitRefs(refs []string, max int) (styled, plain string) {
 // decoration block (when present) and the subject into the remaining
 // space; restStyled carries colors, restPlain is identical character
 // content with no escapes (used as the basis for the selection
-// highlight).
-func commitRowColumns(c gitcmd.Commit, width int) (short, date, author, restStyled, restPlain string, ok bool) {
+// highlight). hasPendingColumn reserves a leading 3-cell action column
+// (1-cell letter + 2-space gap); marked applies strikethrough+dim to
+// the subject portion of restStyled (the plain version is unchanged so
+// row-level highlights remain solid).
+func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, marked bool) (short, date, author, restStyled, restPlain string, ok bool) {
 	const shaW, dateW, authorW = 7, 14, 16
 	const gap = "  "
+	const actionColW = 3 // 1-cell letter + 2-space gap
 	short = c.ShortSHA
 	if len(short) > shaW {
 		short = short[:shaW]
@@ -1953,6 +2489,9 @@ func commitRowColumns(c gitcmd.Commit, width int) (short, date, author, restStyl
 	date = padOrTruncate(c.RelDate, dateW)
 	author = padOrTruncate(c.Author, authorW)
 	fixedW := shaW + len(gap) + dateW + len(gap) + authorW + len(gap)
+	if hasPendingColumn {
+		fixedW += actionColW
+	}
 	restW := width - fixedW
 	if restW < 1 {
 		return short, "", "", "", "", false
@@ -1962,7 +2501,11 @@ func commitRowColumns(c gitcmd.Commit, width int) (short, date, author, restStyl
 	rw := lipgloss.Width(refsPlain)
 	if rw == 0 {
 		subj := padOrTruncate(c.Subject, restW)
-		return short, date, author, subj, subj, true
+		styled := subj
+		if marked {
+			styled = droppedSubjectStyle.Render(subj)
+		}
+		return short, date, author, styled, subj, true
 	}
 	// One-space separator between refs and subject when both fit; if
 	// there isn't room for separator + at least one subject char, pad
@@ -1975,20 +2518,36 @@ func commitRowColumns(c gitcmd.Commit, width int) (short, date, author, restStyl
 	}
 	subjW := restW - rw - 1
 	subj := padOrTruncate(c.Subject, subjW)
-	restStyled = refsStyled + " " + subj
+	subjStyled := subj
+	if marked {
+		subjStyled = droppedSubjectStyle.Render(subj)
+	}
+	restStyled = refsStyled + " " + subjStyled
 	restPlain = refsPlain + " " + subj
 	return short, date, author, restStyled, restPlain, true
 }
 
 // renderLogRow formats one commit row to exactly `width` cells with
-// per-column foreground colors (used for non-selected rows).
-func renderLogRow(c gitcmd.Commit, width int) string {
+// per-column foreground colors (used for non-selected rows). When
+// hasPendingColumn is true the row reserves a leading 3-cell action
+// column (1-cell letter + 2-space gap); marked toggles the action
+// letter to a red-bold `D` and the subject to strikethrough+dim.
+func renderLogRow(c gitcmd.Commit, width int, hasPendingColumn, marked bool) string {
 	const gap = "  "
-	short, date, author, restStyled, _, ok := commitRowColumns(c, width)
+	short, date, author, restStyled, _, ok := commitRowColumns(c, width, hasPendingColumn, marked)
 	if !ok {
 		return padOrTruncate(short, width)
 	}
-	return shortSHAStyle.Render(short) + gap +
+	prefix := ""
+	if hasPendingColumn {
+		if marked {
+			prefix = droppedActionStyle.Render("D") + gap
+		} else {
+			prefix = " " + gap
+		}
+	}
+	return prefix +
+		shortSHAStyle.Render(short) + gap +
 		relDateStyle.Render(date) + gap +
 		authorStyle.Render(author) + gap +
 		restStyled
@@ -1996,13 +2555,24 @@ func renderLogRow(c gitcmd.Commit, width int) string {
 
 // renderLogRowPlain returns the row content as plain text (no color
 // escapes), suitable for wrapping in a row-level highlight style.
-func renderLogRowPlain(c gitcmd.Commit, width int) string {
+// hasPendingColumn reserves the leading 3-cell action column; the
+// action letter is emitted plain (the surrounding row-level highlight
+// already wins visually on selected/match rows, per the slice spec).
+func renderLogRowPlain(c gitcmd.Commit, width int, hasPendingColumn, marked bool) string {
 	const gap = "  "
-	short, date, author, _, restPlain, ok := commitRowColumns(c, width)
+	short, date, author, _, restPlain, ok := commitRowColumns(c, width, hasPendingColumn, marked)
 	if !ok {
 		return padOrTruncate(short, width)
 	}
-	return short + gap + date + gap + author + gap + restPlain
+	prefix := ""
+	if hasPendingColumn {
+		if marked {
+			prefix = "D" + gap
+		} else {
+			prefix = " " + gap
+		}
+	}
+	return prefix + short + gap + date + gap + author + gap + restPlain
 }
 
 // renderLogPanel renders the log panel, including its title and the
@@ -2030,26 +2600,28 @@ func renderLogPanel(m model, w, h int, active bool) string {
 		return strings.Join(lines, "\n")
 	}
 
+	hasPendingColumn := len(m.pendingActions) > 0
 	for row := 0; row < bodyH; row++ {
 		idx := m.viewportTop + row
 		if idx >= len(m.commits) {
 			lines = append(lines, strings.Repeat(" ", w))
 			continue
 		}
+		_, marked := m.pendingActions[m.commits[idx].SHA]
 		var rendered string
 		switch {
 		case idx == m.selectedIdx:
-			plain := renderLogRowPlain(m.commits[idx], w)
+			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, marked)
 			if active {
 				rendered = activeSelectedRowStyle.Render(plain)
 			} else {
 				rendered = inactiveSelectedRowStyle.Render(plain)
 			}
 		case m.isSearchMatch(idx):
-			plain := renderLogRowPlain(m.commits[idx], w)
+			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, marked)
 			rendered = searchMatchRowStyle.Render(plain)
 		default:
-			rendered = renderLogRow(m.commits[idx], w)
+			rendered = renderLogRow(m.commits[idx], w, hasPendingColumn, marked)
 		}
 		lines = append(lines, rendered)
 	}
@@ -2451,7 +3023,125 @@ func (m model) View() string {
 	if m.wtModalOpen {
 		return overlayCentered(base, renderWorktreeModal(m), m.w, m.h)
 	}
+	switch m.rebaseState {
+	case rebaseStateSummary:
+		return overlayCentered(base, renderRebaseSummaryPopup(m), m.w, m.h)
+	case rebaseStateRunning:
+		return overlayCentered(base, renderRebaseRunningPopup(), m.w, m.h)
+	case rebaseStateRefuse:
+		return overlayCentered(base, renderRebaseRefusePopup(m), m.w, m.h)
+	case rebaseStateConflict:
+		return overlayCentered(base, renderRebaseConflictPopup(m), m.w, m.h)
+	case rebaseStateManualWait:
+		return overlayCentered(base, renderRebaseManualWaitPopup(m), m.w, m.h)
+	}
 	return base
+}
+
+// renderRebaseSummaryPopup renders the action-summary popup shown after
+// ctrl+s passes all preconditions. Lists the planned actions (today
+// only "Drop N commits") and the Confirm / Cancel hint.
+func renderRebaseSummaryPopup(m model) string {
+	drops := 0
+	for _, k := range m.pendingActions {
+		if k == ActionDrop {
+			drops++
+		}
+	}
+	title := modalTitleStyle.Render("Pending actions")
+	action := fmt.Sprintf("Drop %d commit%s", drops, plural2(drops))
+	hint := modalHintStyle.Render("enter confirm · esc cancel")
+
+	rows := []string{title, "", "  " + action, "", hint}
+	return padAndBorderModal(rows)
+}
+
+// renderRebaseRunningPopup is the blocking modal shown while a rebase
+// is in flight. Static text per slice 02 — live progress is out of
+// scope and may be added later.
+func renderRebaseRunningPopup() string {
+	title := modalTitleStyle.Render("Rebasing…")
+	hint := modalHintStyle.Render("esc cancel")
+	rows := []string{title, "", hint}
+	return padAndBorderModal(rows)
+}
+
+// renderRebaseConflictPopup renders the conflict popup shown when the
+// rebase halts mid-flight. The header names the halt commit; the body
+// lists conflicted paths; the footer offers the four resolution
+// shortcuts ([a] abort, [t] theirs, [o] ours, [m] resolve manually).
+func renderRebaseConflictPopup(m model) string {
+	title := modalTitleStyle.Render("Conflict")
+	header := "Conflict at"
+	if sha := m.rebaseHalt.HaltSHA; sha != "" {
+		short := sha
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		header += " " + short
+		if subj := m.rebaseHalt.HaltSubject; subj != "" {
+			header += " " + subj
+		}
+	}
+	rows := []string{title, "", header}
+	if len(m.rebaseHalt.ConflictedPaths) > 0 {
+		rows = append(rows, "")
+		for _, p := range m.rebaseHalt.ConflictedPaths {
+			rows = append(rows, "  "+p)
+		}
+	}
+	rows = append(rows, "")
+	rows = append(rows, modalHintStyle.Render("[a] abort  [t] accept theirs  [o] accept ours  [m] resolve manually"))
+	return padAndBorderModal(rows)
+}
+
+// renderRebaseManualWaitPopup renders the manual-resolve waiting state.
+// The user fixes the conflict in another terminal and presses enter to
+// confirm; if any unmerged paths remain at OK time, they are listed
+// here so the user knows exactly what is still pending.
+func renderRebaseManualWaitPopup(m model) string {
+	title := modalTitleStyle.Render("Resolve manually")
+	rows := []string{title, ""}
+	rows = append(rows, "Resolve the conflict in another terminal,")
+	rows = append(rows, "then press enter to continue the rebase.")
+	if len(m.rebaseManualUnmerged) > 0 {
+		rows = append(rows, "")
+		rows = append(rows, "Still unmerged:")
+		for _, p := range m.rebaseManualUnmerged {
+			rows = append(rows, "  "+p)
+		}
+	}
+	rows = append(rows, "")
+	rows = append(rows, modalHintStyle.Render("enter OK · esc back"))
+	return padAndBorderModal(rows)
+}
+
+// renderRebaseRefusePopup renders the precondition-refusal popup with
+// the failure reason and a Close affordance only — there is no Confirm
+// option since the user must address the precondition outside the TUI.
+func renderRebaseRefusePopup(m model) string {
+	title := modalTitleStyle.Render("Cannot save")
+	hint := modalHintStyle.Render("esc · enter · q close")
+	rows := []string{title, "", m.rebaseRefuseMsg, "", hint}
+	return padAndBorderModal(rows)
+}
+
+// padAndBorderModal pads each row to the widest row's width and wraps
+// the block in the shared modal border.
+func padAndBorderModal(rows []string) string {
+	contentW := 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r); w > contentW {
+			contentW = w
+		}
+	}
+	for i, r := range rows {
+		pad := contentW - lipgloss.Width(r)
+		if pad > 0 {
+			rows[i] = r + strings.Repeat(" ", pad)
+		}
+	}
+	return modalBorderStyle.Render(strings.Join(rows, "\n"))
 }
 
 // renderHelpModal builds the help overlay: a bordered box listing every
@@ -2480,6 +3170,8 @@ func renderHelpModal() string {
 			{"ctrl+j / ctrl+k", "move selection"},
 			{"/", "fuzzy search sha / subject / author"},
 			{"n / N", "next / previous search match"},
+			{"ctrl+d", "mark/unmark commit for drop"},
+			{"ctrl+s", "save pending actions"},
 		}},
 		{title: "Files (bottom)", bindings: []binding{
 			{"ctrl+j / ctrl+k", "move selection"},
@@ -2490,7 +3182,7 @@ func renderHelpModal() string {
 			{"j / k", "line scroll"},
 			{"d / u", "page scroll"},
 			{"gg / G", "jump to top / bottom"},
-			{"ctrl+d / ctrl+u", "next / previous hunk (diff); page (message)"},
+			{"ctrl+d / ctrl+u", "next / previous hunk (diff); ctrl+u pages message"},
 			{"h / l", "horizontal scroll (diff)"},
 		}},
 	}
