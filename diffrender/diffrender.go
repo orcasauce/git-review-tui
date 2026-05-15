@@ -209,6 +209,14 @@ func chromaFor(filename string) (chroma.Lexer, *chroma.Style, bool) {
 // token to a styled segment. Lexer state does not persist across
 // lines, which keeps the implementation simple at the cost of some
 // inaccuracy inside multi-line strings or comments.
+//
+// Token values are stripped of newlines and carriage returns: some
+// chroma lexers (notably the JavaScript/TypeScript family) include the
+// trailing "\n" in single-line-comment tokens because line comments
+// are defined to extend through the LF. Letting that newline reach the
+// renderer turns one diff row into two terminal rows, overshoots the
+// panel height, and ultimately causes bubbletea to drop the top row
+// of the screen.
 func highlightLine(lex chroma.Lexer, style *chroma.Style, text string) []segment {
 	it, err := lex.Tokenise(nil, text)
 	if err != nil {
@@ -216,13 +224,29 @@ func highlightLine(lex chroma.Lexer, style *chroma.Style, text string) []segment
 	}
 	var segs []segment
 	for _, tok := range it.Tokens() {
-		if tok.Value == "" {
+		v := stripLineBreaks(tok.Value)
+		if v == "" {
 			continue
 		}
 		s := styleFor(style, tok.Type)
-		segs = append(segs, segment{style: s, text: tok.Value})
+		segs = append(segs, segment{style: s, text: v})
 	}
 	return segs
+}
+
+func stripLineBreaks(s string) string {
+	if !strings.ContainsAny(s, "\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\n' || r == '\r' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // styleCache memoizes the lipgloss.Style for each chroma TokenType so
