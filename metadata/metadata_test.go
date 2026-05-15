@@ -257,3 +257,40 @@ func TestLinesEmptyDetail(t *testing.T) {
 		t.Fatalf("expected nil for empty detail, got %#v", got)
 	}
 }
+
+func TestHeaderLineCount(t *testing.T) {
+	cases := []struct {
+		name string
+		d    gitcmd.CommitDetail
+		want int
+	}{
+		{"empty", gitcmd.CommitDetail{}, 0},
+		{"plain", gitcmd.CommitDetail{
+			SHA: "abc", ShortSHA: "abc",
+			AuthorName: "A", AuthorEmail: "a@x",
+			AuthorDateISO: "2026-05-13T10:42:11+00:00",
+			Body:          "subj",
+		}, 3}, // sha + author + blank
+		{"annotated_tag", gitcmd.CommitDetail{
+			SHA: "abc", ShortSHA: "abc",
+			AuthorName: "A", AuthorEmail: "a@x",
+			AuthorDateISO: "2026-05-13T10:42:11+00:00",
+			Tags: []gitcmd.TagInfo{{Name: "v1", Annotated: true, Message: "L1\nL2"}},
+		}, 6}, // sha + author + tag row + 2 msg lines + blank
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := HeaderLineCount(c.d)
+			if got != c.want {
+				t.Fatalf("got %d want %d", got, c.want)
+			}
+			lines := Lines(c.d, time.UTC)
+			// HeaderLineCount must equal the index at which body begins —
+			// i.e. the line right after the blank separator. The blank
+			// separator itself is the last line of the header.
+			if got > 0 && lines[got-1] != "" {
+				t.Fatalf("header should end with blank separator; got %q at index %d", lines[got-1], got-1)
+			}
+		})
+	}
+}

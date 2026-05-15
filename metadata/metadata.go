@@ -13,6 +13,28 @@ import (
 	"github.com/orcasauce/git-review-tui/gitcmd"
 )
 
+// HeaderLineCount returns the number of leading lines in Lines that
+// belong to the metadata header (short sha, author/date, optional tag
+// block, and the blank separator). The body content starts at index
+// HeaderLineCount(d). Returns 0 when Lines would return nil.
+//
+// Callers can use this to render the header as a sticky prefix so the
+// short sha can't be scrolled off the top of the message panel.
+func HeaderLineCount(d gitcmd.CommitDetail) int {
+	if d.SHA == "" {
+		return 0
+	}
+	n := 2 // sha line + author line
+	for _, t := range d.Tags {
+		n++ // "Tags: <name>" row
+		if t.Annotated && t.Message != "" {
+			n += len(strings.Split(t.Message, "\n"))
+		}
+	}
+	n++ // blank separator
+	return n
+}
+
 // Lines returns the ordered plain-text lines for the message panel:
 // short sha [+ refs], author + date, optional Tags block, blank
 // separator, then body lines.
