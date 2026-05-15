@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alecthomas/chroma/v2"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -155,16 +156,16 @@ func TestFormatLine_StylingOnAddAndDel(t *testing.T) {
 	if !strings.Contains(delOut, "\x1b[") {
 		t.Errorf("expected ANSI escape on del line: %q", delOut)
 	}
-	// Context line content itself shouldn't carry the +/- color — but
-	// the gutter does, so we strip the gutter prefix before checking.
-	rest := strings.TrimPrefix(ctxOut, gutterStyle.Render(""))
-	if strings.Contains(rest, "[38;5;114m") || strings.Contains(rest, "[38;5;203m") {
-		t.Errorf("context line should not carry +/- color: %q", ctxOut)
+	// Context lines should not carry any of the add/del banding colours.
+	for _, hex := range []string{addBodyBg, delBodyBg, addGutterBg, delGutterBg} {
+		if strings.Contains(ctxOut, hex) {
+			t.Errorf("context line unexpectedly contains banding hex %s: %q", hex, ctxOut)
+		}
 	}
-	if !strings.Contains(addOut, "+TWO") {
+	if !strings.Contains(addOut, "TWO") {
 		t.Errorf("add line lost its content: %q", addOut)
 	}
-	if !strings.Contains(delOut, "-two") {
+	if !strings.Contains(delOut, "two") {
 		t.Errorf("del line lost its content: %q", delOut)
 	}
 }
@@ -208,10 +209,9 @@ func TestFormatLine_HorizontalScroll(t *testing.T) {
 `
 	r := Parse(in, "")
 	out := r.FormatLine(1, 40, 4)
-	// hScroll=4 should drop the first 4 chars of "abcdefghij" → "efghij",
-	// then prepend the "+" marker → "+efghij".
-	if !strings.Contains(out, "+efghij") {
-		t.Errorf("expected '+efghij' after hScroll=4: %q", out)
+	// hScroll=4 should drop the first 4 chars of "abcdefghij" → "efghij".
+	if !strings.Contains(out, "efghij") {
+		t.Errorf("expected 'efghij' after hScroll=4: %q", out)
 	}
 	if strings.Contains(out, "abcd") {
 		t.Errorf("expected 'abcd' to be scrolled off: %q", out)
@@ -362,8 +362,7 @@ func TestParse_SyntaxHighlightingForKnownLanguage(t *testing.T) {
 	if !differs {
 		t.Errorf("highlighted output identical to plain output for goDiff")
 	}
-	// The marker glyph on the add line must still appear (diff signal
-	// preserved): look for a "+" somewhere in the body of an add line.
+	// Content tokens still survive in the rendered bytes.
 	var addIdx int = -1
 	for i, l := range hl.Lines {
 		if l.Kind == Add {
@@ -375,10 +374,6 @@ func TestParse_SyntaxHighlightingForKnownLanguage(t *testing.T) {
 		t.Fatalf("expected at least one Add line in goDiff")
 	}
 	out := hl.FormatLine(addIdx, 80, 0)
-	if !strings.Contains(out, "+") {
-		t.Errorf("highlighted add line lost its '+' marker: %q", out)
-	}
-	// Content tokens still survive in the rendered bytes.
 	if !strings.Contains(out, "greeting") && !strings.Contains(out, "hello") && !strings.Contains(out, "main") {
 		t.Errorf("highlighted add line lost its content: %q", out)
 	}
@@ -433,11 +428,236 @@ func TestFormatLine_HighlightedRespectsWidthAndScroll(t *testing.T) {
 	if got, want := visibleLen(out), w; got != want {
 		t.Errorf("visibleLen(out) = %d, want %d (out=%q)", got, want, out)
 	}
-	// Horizontal scroll past the start: marker should remain and some
+	// Horizontal scroll past the start: gutter band remains and some
 	// trailing characters should appear.
 	scrolled := r.FormatLine(1, 80, 4)
-	if !strings.Contains(scrolled, "-") {
-		t.Errorf("scrolled highlighted del line missing marker: %q", scrolled)
+	if !strings.Contains(scrolled, styleOpen(delGutterBandStyle)) {
+		t.Errorf("scrolled highlighted del line missing gutter band: %q", scrolled)
+	}
+}
+
+// styleOpen returns the opening SGR escape that lipgloss emits when
+// rendering this style — extracted by rendering a marker character and
+// slicing off everything up to it. Robust against colour-profile
+// degradation (the helper picks up whatever escape lipgloss actually
+// emits at the current profile, rather than asserting a hard-coded
+// truecolor hex).
+func styleOpen(s lipgloss.Style) string {
+	const marker = "\x01"
+	r := s.Render(marker)
+	i := strings.Index(r, marker)
+	if i < 0 {
+		return ""
+	}
+	return r[:i]
+}
+
+// findAddDelCtxIdx returns the first index of each Kind in r.Lines, or
+// -1 if none exists.
+func findAddDelCtxIdx(r Result) (add, del, ctx int) {
+	add, del, ctx = -1, -1, -1
+	for i, l := range r.Lines {
+		switch l.Kind {
+		case Add:
+			if add == -1 {
+				add = i
+			}
+		case Del:
+			if del == -1 {
+				del = i
+			}
+		case Context:
+			if ctx == -1 {
+				ctx = i
+			}
+		}
+	}
+	return
+}
+
+func TestFormatLine_AddRowBodyBackground(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	addIdx, _, _ := findAddDelCtxIdx(r)
+	if addIdx < 0 {
+		t.Fatalf("sampleDiff has no add row")
+	}
+	out := r.FormatLine(addIdx, 40, 0)
+	bgOpen := styleOpen(addBodyBgStyle)
+	if bgOpen == "" {
+		t.Fatalf("could not derive opening escape for addBodyBgStyle")
+	}
+	if !strings.Contains(out, bgOpen) {
+		t.Errorf("add row missing body-bg escape %q: %q", bgOpen, out)
+	}
+}
+
+func TestFormatLine_DelRowBodyBackground(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	_, delIdx, _ := findAddDelCtxIdx(r)
+	if delIdx < 0 {
+		t.Fatalf("sampleDiff has no del row")
+	}
+	out := r.FormatLine(delIdx, 40, 0)
+	bgOpen := styleOpen(delBodyBgStyle)
+	if bgOpen == "" {
+		t.Fatalf("could not derive opening escape for delBodyBgStyle")
+	}
+	if !strings.Contains(out, bgOpen) {
+		t.Errorf("del row missing body-bg escape %q: %q", bgOpen, out)
+	}
+}
+
+func TestFormatLine_AddRowGutterBand(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	addIdx, _, _ := findAddDelCtxIdx(r)
+	if addIdx < 0 {
+		t.Fatalf("sampleDiff has no add row")
+	}
+	out := r.FormatLine(addIdx, 40, 0)
+	bandOpen := styleOpen(addGutterBandStyle)
+	if !strings.Contains(out, bandOpen) {
+		t.Errorf("add row missing gutter-band escape %q: %q", bandOpen, out)
+	}
+}
+
+func TestFormatLine_DelRowGutterBand(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	_, delIdx, _ := findAddDelCtxIdx(r)
+	if delIdx < 0 {
+		t.Fatalf("sampleDiff has no del row")
+	}
+	out := r.FormatLine(delIdx, 40, 0)
+	bandOpen := styleOpen(delGutterBandStyle)
+	if !strings.Contains(out, bandOpen) {
+		t.Errorf("del row missing gutter-band escape %q: %q", bandOpen, out)
+	}
+}
+
+func TestFormatLine_ContextRowHasNoBanding(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	_, _, ctxIdx := findAddDelCtxIdx(r)
+	if ctxIdx < 0 {
+		t.Fatalf("sampleDiff has no context row")
+	}
+	out := r.FormatLine(ctxIdx, 40, 0)
+	for name, s := range map[string]lipgloss.Style{
+		"addBodyBg":    addBodyBgStyle,
+		"delBodyBg":    delBodyBgStyle,
+		"addGutterBg":  addGutterBandStyle,
+		"delGutterBg":  delGutterBandStyle,
+	} {
+		open := styleOpen(s)
+		if open != "" && strings.Contains(out, open) {
+			t.Errorf("context row unexpectedly carries %s escape %q: %q", name, open, out)
+		}
+	}
+}
+
+// TestFormatLine_GutterOnlyAtZeroBodyWidth: render an add row at a
+// width that leaves zero body cells, and confirm the gutter band is
+// still rendered and the body region is empty.
+func TestFormatLine_GutterOnlyAtZeroBodyWidth(t *testing.T) {
+	r := Parse(sampleDiff, "")
+	addIdx, _, _ := findAddDelCtxIdx(r)
+	if addIdx < 0 {
+		t.Fatalf("sampleDiff has no add row")
+	}
+	w := r.GutterRenderWidth()
+	out := r.FormatLine(addIdx, w, 0)
+	if !strings.Contains(out, styleOpen(addGutterBandStyle)) {
+		t.Errorf("expected gutter band escape at zero-body width: %q", out)
+	}
+	if got, want := visibleLen(out), w; got != want {
+		t.Errorf("visibleLen(out) = %d, want %d (out=%q)", got, want, out)
+	}
+	if strings.Contains(out, "TWO") {
+		t.Errorf("add row body content leaked into zero-body render: %q", out)
+	}
+}
+
+func TestFormatLine_HighlightedAddRowChromaFgOverBodyBg(t *testing.T) {
+	r := Parse(goDiff, "x.go")
+	addIdx, _, _ := findAddDelCtxIdx(r)
+	if addIdx < 0 {
+		t.Fatalf("goDiff has no add row")
+	}
+	out := r.FormatLine(addIdx, 80, 0)
+	if !strings.Contains(out, styleOpen(addBodyBgStyle)) {
+		t.Errorf("highlighted add row missing body-bg escape: %q", out)
+	}
+	// A chroma-coloured token should still emit a foreground SGR
+	// somewhere — the bg tint must compose with, not replace, the
+	// per-token fg.
+	if !strings.Contains(out, "\x1b[38;") {
+		t.Errorf("highlighted add row missing any chroma foreground escape: %q", out)
+	}
+}
+
+// TestStyleFor_TokenAnsiMapping checks the contract spelled out in the
+// PRD: each meaningful token category resolves to a specific ANSI
+// palette index, subcategories inherit from their parent (e.g.
+// LiteralStringDouble → LiteralString → 2), and Operator/Punctuation
+// emit no foreground escape at all (terminal default fg).
+func TestStyleFor_TokenAnsiMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		tt   chroma.TokenType
+		ansi string // "" means: expect no fg escape
+	}{
+		{"Comment", chroma.Comment, "8"},
+		{"CommentSingle (subcategory)", chroma.CommentSingle, "8"},
+		{"Keyword", chroma.Keyword, "4"},
+		{"KeywordType", chroma.KeywordType, "6"},
+		{"LiteralString", chroma.LiteralString, "2"},
+		{"LiteralStringDouble (subcategory)", chroma.LiteralStringDouble, "2"},
+		{"LiteralNumber", chroma.LiteralNumber, "3"},
+		{"LiteralNumberInteger (subcategory)", chroma.LiteralNumberInteger, "3"},
+		{"NameClass", chroma.NameClass, "6"},
+		{"NameFunction", chroma.NameFunction, "5"},
+		{"NameBuiltin", chroma.NameBuiltin, "1"},
+		{"NameConstant", chroma.NameConstant, "1"},
+		{"Operator", chroma.Operator, ""},
+		{"Punctuation", chroma.Punctuation, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rendered := styleFor(c.tt).Render("x")
+			if c.ansi == "" {
+				if strings.Contains(rendered, "\x1b[") {
+					t.Errorf("%v: expected no SGR escape, got %q", c.tt, rendered)
+				}
+				return
+			}
+			wantOpen := lipgloss.NewStyle().Foreground(lipgloss.Color(c.ansi)).Render("\x01")
+			i := strings.Index(wantOpen, "\x01")
+			if i <= 0 {
+				t.Fatalf("could not derive opening escape for ANSI %s", c.ansi)
+			}
+			open := wantOpen[:i]
+			if !strings.Contains(rendered, open) {
+				t.Errorf("%v: rendered %q does not contain ANSI %s opener %q",
+					c.tt, rendered, c.ansi, open)
+			}
+		})
+	}
+}
+
+// TestStyleFor_DropsBoldItalic ensures the new mapping never emits bold
+// (SGR 1) or italic (SGR 3) escapes, even for token types where chroma's
+// native style would have set them (Keyword is bold under the native
+// style, for instance).
+func TestStyleFor_DropsBoldItalic(t *testing.T) {
+	for _, tt := range []chroma.TokenType{
+		chroma.Keyword, chroma.NameFunction, chroma.NameClass, chroma.Comment,
+	} {
+		rendered := styleFor(tt).Render("x")
+		// SGR "1" = bold, SGR "3" = italic. Look for them as standalone
+		// parameters (preceded by '[' or ';', followed by ';' or 'm').
+		for _, bad := range []string{"\x1b[1m", "\x1b[3m", ";1m", ";3m", "[1;", "[3;"} {
+			if strings.Contains(rendered, bad) {
+				t.Errorf("%v rendered with bold/italic (%q) in %q", tt, bad, rendered)
+			}
+		}
 	}
 }
 

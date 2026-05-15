@@ -11,10 +11,9 @@
 //
 // When Parse is called with a non-empty filename whose extension chroma
 // recognizes, each Line gets a slice of styled [segment]s so the diff
-// panel can render syntax-highlighted code. The "+" / "-" marker keeps
-// its diff color; the body content uses chroma's token colors. For
-// unknown extensions (or an empty filename) the body falls back to the
-// plain diff coloring used in earlier slices.
+// panel can render syntax-highlighted code. The body content uses
+// chroma's token colors. For unknown extensions (or an empty filename)
+// the body falls back to the plain diff coloring used in earlier slices.
 package diffrender
 
 import (
@@ -23,7 +22,6 @@ import (
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/lexers"
-	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -124,10 +122,10 @@ func Parse(raw, filename string) Result {
 	r.OldW = numWidth(r.OldW)
 	r.NewW = numWidth(r.NewW)
 
-	if lex, style, ok := chromaFor(filename); ok {
+	if lex, ok := chromaFor(filename); ok {
 		r.highlighted = true
 		for i := range r.Lines {
-			r.Lines[i].segs = highlightLine(lex, style, r.Lines[i].Text)
+			r.Lines[i].segs = highlightLine(lex, r.Lines[i].Text)
 		}
 	}
 	return r
@@ -172,37 +170,43 @@ func numWidth(n int) int {
 	return w
 }
 
-var (
-	addStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
-	delStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	gutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	// markerAddStyle and markerDelStyle color just the leading +/- in
-	// highlighted mode; the body uses chroma colors.
-	markerAddStyle = addStyle
-	markerDelStyle = delStyle
+// Base16-twilight palette entries used for the add/del row banding.
+// addGutterBg / delGutterBg are base0B / base08 (saturated). addBodyBg /
+// delBodyBg are those hues darkened ~60% to match nvim's DiffAdd /
+// DiffDelete construction. invertedFg is base00, the terminal-background
+// colour, used as foreground on the saturated gutter band.
+const (
+	addGutterBg = "#8f9d6a"
+	delGutterBg = "#cf6a4c"
+	addBodyBg   = "#393e2a"
+	delBodyBg   = "#522a1e"
+	invertedFg  = "#1e1e1e"
 )
 
-// chromaStyle is the chroma color theme used for syntax highlighting.
-// Picked once at package init so terminal output stays consistent.
-var chromaStyle = func() *chroma.Style {
-	if s := styles.Get("native"); s != nil {
-		return s
-	}
-	return styles.Fallback
-}()
+var (
+	gutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
-// chromaFor returns the lexer and style to use for filename, or
-// ok=false when chroma should be skipped (empty filename or unknown
-// extension).
-func chromaFor(filename string) (chroma.Lexer, *chroma.Style, bool) {
+	addGutterBandStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color(addGutterBg)).
+				Foreground(lipgloss.Color(invertedFg))
+	delGutterBandStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color(delGutterBg)).
+				Foreground(lipgloss.Color(invertedFg))
+	addBodyBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(addBodyBg))
+	delBodyBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(delBodyBg))
+)
+
+// chromaFor returns the lexer to use for filename, or ok=false when
+// chroma should be skipped (empty filename or unknown extension).
+func chromaFor(filename string) (chroma.Lexer, bool) {
 	if filename == "" {
-		return nil, nil, false
+		return nil, false
 	}
 	lex := lexers.Match(filename)
 	if lex == nil || lex == lexers.Fallback {
-		return nil, nil, false
+		return nil, false
 	}
-	return lex, chromaStyle, true
+	return lex, true
 }
 
 // highlightLine tokenizes a single line of text and converts each
@@ -217,7 +221,7 @@ func chromaFor(filename string) (chroma.Lexer, *chroma.Style, bool) {
 // renderer turns one diff row into two terminal rows, overshoots the
 // panel height, and ultimately causes bubbletea to drop the top row
 // of the screen.
-func highlightLine(lex chroma.Lexer, style *chroma.Style, text string) []segment {
+func highlightLine(lex chroma.Lexer, text string) []segment {
 	it, err := lex.Tokenise(nil, text)
 	if err != nil {
 		return nil
@@ -228,7 +232,7 @@ func highlightLine(lex chroma.Lexer, style *chroma.Style, text string) []segment
 		if v == "" {
 			continue
 		}
-		s := styleFor(style, tok.Type)
+		s := styleFor(tok.Type)
 		segs = append(segs, segment{style: s, text: v})
 	}
 	return segs
@@ -249,31 +253,53 @@ func stripLineBreaks(s string) string {
 	return b.String()
 }
 
+// tokenColors maps chroma token categories to ANSI 16-palette indices.
+// The terminal theme decides the actual colour each index renders as, so
+// highlighted code inherits whatever palette the user has configured at
+// the terminal level (e.g. base16-twilight) rather than baking in chroma's
+// own hex values. Token types not present here render with no foreground
+// (terminal default) — that covers operators, punctuation, and anything
+// else not on the contract list.
+var tokenColors = map[chroma.TokenType]string{
+	chroma.Comment:       "8",
+	chroma.Keyword:       "4",
+	chroma.LiteralString: "2",
+	chroma.LiteralNumber: "3",
+	chroma.NameClass:     "6",
+	chroma.KeywordType:   "6",
+	chroma.NameFunction:  "5",
+	chroma.NameBuiltin:   "1",
+	chroma.NameConstant:  "1",
+}
+
 // styleCache memoizes the lipgloss.Style for each chroma TokenType so
 // FormatLine doesn't rebuild styles per token.
 var styleCache = map[chroma.TokenType]lipgloss.Style{}
 
-func styleFor(style *chroma.Style, tt chroma.TokenType) lipgloss.Style {
+// styleFor resolves a chroma TokenType to its lipgloss.Style by walking
+// the chroma category chain (exact → subcategory → category), mirroring
+// chroma's own style-resolution rule. Bold/italic are intentionally
+// dropped: the palette colour alone carries the cue.
+func styleFor(tt chroma.TokenType) lipgloss.Style {
 	if s, ok := styleCache[tt]; ok {
 		return s
 	}
-	entry := style.Get(tt)
 	s := lipgloss.NewStyle()
-	if entry.Colour.IsSet() {
-		s = s.Foreground(lipgloss.Color(entry.Colour.String()))
-	}
-	if entry.Bold == chroma.Yes {
-		s = s.Bold(true)
-	}
-	if entry.Italic == chroma.Yes {
-		s = s.Italic(true)
+	if c, ok := tokenColors[tt]; ok {
+		s = s.Foreground(lipgloss.Color(c))
+	} else if c, ok := tokenColors[tt.SubCategory()]; ok {
+		s = s.Foreground(lipgloss.Color(c))
+	} else if c, ok := tokenColors[tt.Category()]; ok {
+		s = s.Foreground(lipgloss.Color(c))
 	}
 	styleCache[tt] = s
 	return s
 }
 
 // GutterRenderWidth returns the cell-count width of the gutter as
-// produced by FormatLine: "<oldW> <newW> ".
+// produced by FormatLine: "<oldW> <newW> ". The trailing space keeps
+// the row's leading colour block visually separated from the body on
+// add/del rows.
 func (r Result) GutterRenderWidth() int {
 	return r.OldW + 1 + r.NewW + 1
 }
@@ -288,25 +314,17 @@ func (r Result) FormatLine(idx, width, hScroll int) string {
 	}
 	l := r.Lines[idx]
 	gutter := r.formatGutter(l)
-	gutterCells := r.GutterRenderWidth()
-	textW := width - gutterCells
-	if textW < 0 {
-		textW = 0
+	bodyW := width - r.GutterRenderWidth()
+	if bodyW < 0 {
+		bodyW = 0
 	}
 	if l.segs != nil {
-		return gutter + formatHighlightedBody(l, textW, hScroll)
+		return gutter + formatHighlightedBody(l, bodyW, hScroll)
 	}
-	return gutter + formatPlainBody(l, textW, hScroll)
+	return gutter + formatPlainBody(l, bodyW, hScroll)
 }
 
-func formatPlainBody(l Line, textW, hScroll int) string {
-	marker := " "
-	switch l.Kind {
-	case Add:
-		marker = "+"
-	case Del:
-		marker = "-"
-	}
+func formatPlainBody(l Line, bodyW, hScroll int) string {
 	text := l.Text
 	if hScroll > 0 {
 		runes := []rune(text)
@@ -316,53 +334,45 @@ func formatPlainBody(l Line, textW, hScroll int) string {
 			text = string(runes[hScroll:])
 		}
 	}
-	body := marker + text
-	if len(body) > textW {
-		body = body[:textW]
-	} else if textW > len(body) {
-		body += strings.Repeat(" ", textW-len(body))
+	body := text
+	if len(body) > bodyW {
+		body = body[:bodyW]
+	} else if bodyW > len(body) {
+		body += strings.Repeat(" ", bodyW-len(body))
 	}
 	switch l.Kind {
 	case Add:
-		body = addStyle.Render(body)
+		return addBodyBgStyle.Render(body)
 	case Del:
-		body = delStyle.Render(body)
+		return delBodyBgStyle.Render(body)
 	}
 	return body
 }
 
-// formatHighlightedBody renders the marker (in diff color) followed by
-// the chroma-tokenized body. hScroll skips cells of the content; width
-// truncates the full marker+content to textW cells.
-func formatHighlightedBody(l Line, textW, hScroll int) string {
-	if textW == 0 {
+// formatHighlightedBody renders the chroma-tokenized body. hScroll skips
+// cells of the content; bodyW truncates to that many cells. On add/del
+// rows the body tint is composed onto each segment's chroma style so the
+// per-token foreground renders over the tint.
+func formatHighlightedBody(l Line, bodyW, hScroll int) string {
+	if bodyW == 0 {
 		return ""
 	}
-	var marker string
+	bodyBg := ""
 	switch l.Kind {
 	case Add:
-		marker = markerAddStyle.Render("+")
+		bodyBg = addBodyBg
 	case Del:
-		marker = markerDelStyle.Render("-")
-	default:
-		marker = " "
-	}
-	// remaining cells available for the body content after the marker.
-	bodyW := textW - 1
-	if bodyW < 0 {
-		bodyW = 0
+		bodyBg = delBodyBg
 	}
 
 	var b strings.Builder
-	b.WriteString(marker)
-	cells := 0      // cells emitted into body
-	skipped := 0    // text cells skipped due to hScroll
+	cells := 0
+	skipped := 0
 	for _, seg := range l.segs {
 		if cells >= bodyW {
 			break
 		}
 		runes := []rune(seg.text)
-		// skip leading runes for hScroll
 		if skipped < hScroll {
 			drop := hScroll - skipped
 			if drop >= len(runes) {
@@ -375,20 +385,37 @@ func formatHighlightedBody(l Line, textW, hScroll int) string {
 		if len(runes) == 0 {
 			continue
 		}
-		// truncate to remaining width
 		if len(runes) > bodyW-cells {
 			runes = runes[:bodyW-cells]
 		}
-		b.WriteString(seg.style.Render(string(runes)))
+		s := seg.style
+		if bodyBg != "" {
+			s = s.Background(lipgloss.Color(bodyBg))
+		}
+		b.WriteString(s.Render(string(runes)))
 		cells += len(runes)
 	}
-	// pad to textW (1 for marker + bodyW).
 	if cells < bodyW {
-		b.WriteString(strings.Repeat(" ", bodyW-cells))
+		pad := strings.Repeat(" ", bodyW-cells)
+		switch l.Kind {
+		case Add:
+			b.WriteString(addBodyBgStyle.Render(pad))
+		case Del:
+			b.WriteString(delBodyBgStyle.Render(pad))
+		default:
+			b.WriteString(pad)
+		}
 	}
 	return b.String()
 }
 
+// formatGutter renders the gutter band: two line-number slots with a
+// trailing separator space. On add/del rows the whole band carries a
+// saturated background and an inverted foreground so the digits read
+// as one coloured tag — the row's banded body background carries the
+// add/del signal, so no `+`/`-` glyph is needed. On context rows the
+// band keeps the muted gutterStyle foreground over the default
+// background.
 func (r Result) formatGutter(l Line) string {
 	oldS := ""
 	if l.OldNum > 0 {
@@ -398,7 +425,15 @@ func (r Result) formatGutter(l Line) string {
 	if l.NewNum > 0 {
 		newS = strconv.Itoa(l.NewNum)
 	}
-	return gutterStyle.Render(padLeft(oldS, r.OldW) + " " + padLeft(newS, r.NewW) + " ")
+	nums := padLeft(oldS, r.OldW) + " " + padLeft(newS, r.NewW) + " "
+	switch l.Kind {
+	case Add:
+		return addGutterBandStyle.Render(nums)
+	case Del:
+		return delGutterBandStyle.Render(nums)
+	default:
+		return gutterStyle.Render(nums)
+	}
 }
 
 func padLeft(s string, w int) string {
