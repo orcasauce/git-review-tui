@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -123,174 +122,97 @@ func TestFilterRefs(t *testing.T) {
 	}
 }
 
-func TestLinesTypicalCommit(t *testing.T) {
+func TestSummary(t *testing.T) {
 	loc := time.FixedZone("UTC", 0)
-	d := gitcmd.CommitDetail{
+	base := gitcmd.CommitDetail{
 		SHA:           "abcdef0123456789",
 		ShortSHA:      "abcdef0",
 		AuthorName:    "Whitney Beck",
 		AuthorEmail:   "wb@example.com",
 		AuthorDateISO: "2026-05-13T10:42:11+00:00",
 		AuthorDateRel: "2 days ago",
-		Refs:          []string{"HEAD -> main", "origin/main"},
-		Body:          "Subject line\n\nBody paragraph.",
 	}
-	got := Lines(d, loc)
-	want := []string{
-		"abcdef0 (main, origin/main)",
-		"Whitney Beck <wb@example.com>  2026-05-13 10:42:11 (2 days ago)",
-		"",
-		"Subject line",
-		"",
-		"Body paragraph.",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v\nwant %#v", got, want)
-	}
-}
+	const wantAuthor = "Whitney Beck <wb@example.com>  2026-05-13 10:42:11 (2 days ago)"
 
-func TestLinesNoRefsNoTags(t *testing.T) {
-	loc := time.FixedZone("UTC", 0)
-	d := gitcmd.CommitDetail{
-		SHA:           "abcdef0123456789",
-		ShortSHA:      "abcdef0",
-		AuthorName:    "A",
-		AuthorEmail:   "a@x",
-		AuthorDateISO: "2026-05-13T10:42:11+00:00",
-		AuthorDateRel: "now",
-		Body:          "subj",
-	}
-	got := Lines(d, loc)
-	want := []string{
-		"abcdef0",
-		"A <a@x>  2026-05-13 10:42:11 (now)",
-		"",
-		"subj",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v\nwant %#v", got, want)
-	}
-}
-
-func TestLinesAnnotatedTag(t *testing.T) {
-	loc := time.FixedZone("UTC", 0)
-	d := gitcmd.CommitDetail{
-		SHA:           "abcdef0123456789",
-		ShortSHA:      "abcdef0",
-		AuthorName:    "A",
-		AuthorEmail:   "a@x",
-		AuthorDateISO: "2026-05-13T10:42:11+00:00",
-		AuthorDateRel: "now",
-		Tags: []gitcmd.TagInfo{
-			{Name: "v1.0", Annotated: true, Message: "Release v1.0\n\nNotes here"},
-		},
-		Body: "subj",
-	}
-	got := Lines(d, loc)
-	want := []string{
-		"abcdef0",
-		"A <a@x>  2026-05-13 10:42:11 (now)",
-		"Tags:       v1.0 (annotated)",
-		"              Release v1.0",
-		"              ",
-		"              Notes here",
-		"",
-		"subj",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v\nwant %#v", got, want)
-	}
-}
-
-func TestLinesEmptyBody(t *testing.T) {
-	loc := time.FixedZone("UTC", 0)
-	d := gitcmd.CommitDetail{
-		SHA:           "abcdef0123456789",
-		ShortSHA:      "abcdef0",
-		AuthorName:    "A",
-		AuthorEmail:   "a@x",
-		AuthorDateISO: "2026-05-13T10:42:11+00:00",
-		AuthorDateRel: "now",
-	}
-	got := Lines(d, loc)
-	// Trailing "" separator with no body lines.
-	if len(got) != 3 {
-		t.Fatalf("expected 3 lines, got %d: %#v", len(got), got)
-	}
-	if got[2] != "" {
-		t.Fatalf("expected blank separator at index 2, got %q", got[2])
-	}
-}
-
-func TestLinesMergeCommit(t *testing.T) {
-	loc := time.FixedZone("UTC", 0)
-	d := gitcmd.CommitDetail{
-		SHA:           "abcdef0123456789",
-		ShortSHA:      "abcdef0",
-		AuthorName:    "A",
-		AuthorEmail:   "a@x",
-		AuthorDateISO: "2026-05-13T10:42:11+00:00",
-		AuthorDateRel: "now",
-		Parents:       []string{"p1", "p2"},
-		Body:          "Merge subj",
-	}
-	got := Lines(d, loc)
-	want := []string{
-		"abcdef0",
-		"A <a@x>  2026-05-13 10:42:11 (now)",
-		"",
-		"Merge subj",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v\nwant %#v", got, want)
-	}
-	// Ensure no "Parents:" row leaked through.
-	for _, l := range got {
-		if strings.HasPrefix(l, "Parents:") {
-			t.Fatalf("Parents row should not appear: %q", l)
-		}
-	}
-}
-
-func TestLinesEmptyDetail(t *testing.T) {
-	if got := Lines(gitcmd.CommitDetail{}, time.UTC); got != nil {
-		t.Fatalf("expected nil for empty detail, got %#v", got)
-	}
-}
-
-func TestHeaderLineCount(t *testing.T) {
 	cases := []struct {
-		name string
-		d    gitcmd.CommitDetail
-		want int
+		name  string
+		mutate func(*gitcmd.CommitDetail)
+		want  [3]string
 	}{
-		{"empty", gitcmd.CommitDetail{}, 0},
-		{"plain", gitcmd.CommitDetail{
-			SHA: "abc", ShortSHA: "abc",
-			AuthorName: "A", AuthorEmail: "a@x",
-			AuthorDateISO: "2026-05-13T10:42:11+00:00",
-			Body:          "subj",
-		}, 3}, // sha + author + blank
-		{"annotated_tag", gitcmd.CommitDetail{
-			SHA: "abc", ShortSHA: "abc",
-			AuthorName: "A", AuthorEmail: "a@x",
-			AuthorDateISO: "2026-05-13T10:42:11+00:00",
-			Tags: []gitcmd.TagInfo{{Name: "v1", Annotated: true, Message: "L1\nL2"}},
-		}, 6}, // sha + author + tag row + 2 msg lines + blank
+		{
+			name:   "no_refs_no_tags",
+			mutate: func(d *gitcmd.CommitDetail) {},
+			want:   [3]string{"abcdef0", wantAuthor, ""},
+		},
+		{
+			name: "refs_present",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Refs = []string{"HEAD -> main", "origin/main"}
+			},
+			want: [3]string{"abcdef0 (main, origin/main)", wantAuthor, ""},
+		},
+		{
+			name: "refs_with_tag_filtered_out",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Refs = []string{"HEAD -> main", "tag: v1.0", "origin/main"}
+			},
+			want: [3]string{"abcdef0 (main, origin/main)", wantAuthor, ""},
+		},
+		{
+			name: "single_lightweight_tag",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Tags = []gitcmd.TagInfo{{Name: "v1.0"}}
+			},
+			want: [3]string{"abcdef0", wantAuthor, "Tags: v1.0"},
+		},
+		{
+			name: "single_annotated_tag_no_body",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Tags = []gitcmd.TagInfo{
+					{Name: "v1.0", Annotated: true, Message: "Release v1.0\n\nNotes"},
+				}
+			},
+			// Annotated bodies and the "(annotated)" suffix are not
+			// rendered in the summary form.
+			want: [3]string{"abcdef0", wantAuthor, "Tags: v1.0"},
+		},
+		{
+			name: "two_tags",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Tags = []gitcmd.TagInfo{{Name: "v1.0"}, {Name: "v1.0-rc1"}}
+			},
+			want: [3]string{"abcdef0", wantAuthor, "Tags: v1.0, v1.0-rc1"},
+		},
+		{
+			name: "many_tags_truncated_with_plus_n_more",
+			mutate: func(d *gitcmd.CommitDetail) {
+				d.Tags = []gitcmd.TagInfo{
+					{Name: "v1.0"},
+					{Name: "v1.0-rc1"},
+					{Name: "release"},
+					{Name: "stable"},
+					{Name: "ga"},
+				}
+			},
+			want: [3]string{"abcdef0", wantAuthor, "Tags: v1.0, v1.0-rc1 (+3 more)"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := HeaderLineCount(c.d)
-			if got != c.want {
-				t.Fatalf("got %d want %d", got, c.want)
-			}
-			lines := Lines(c.d, time.UTC)
-			// HeaderLineCount must equal the index at which body begins —
-			// i.e. the line right after the blank separator. The blank
-			// separator itself is the last line of the header.
-			if got > 0 && lines[got-1] != "" {
-				t.Fatalf("header should end with blank separator; got %q at index %d", lines[got-1], got-1)
+			d := base
+			c.mutate(&d)
+			got := Summary(d, loc)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("Summary mismatch\n got: %#v\nwant: %#v", got, c.want)
 			}
 		})
 	}
 }
+
+func TestSummaryEmptyDetail(t *testing.T) {
+	got := Summary(gitcmd.CommitDetail{}, time.UTC)
+	if got != ([3]string{}) {
+		t.Fatalf("expected zero [3]string for empty detail, got %#v", got)
+	}
+}
+

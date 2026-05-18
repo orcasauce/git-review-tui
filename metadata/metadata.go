@@ -1,8 +1,8 @@
-// Package metadata owns the commit-message header block: the short
-// sha and refs line, the author+date line, the optional Tags block,
-// and the blank separator before the body. Lines is a pure function;
-// the *time.Location is injected so callers can pass time.Local in
-// production and a fixed zone in tests.
+// Package metadata builds the condensed three-row description of a
+// commit (short sha + refs, author + date, tags summary) that the v5
+// layout renders into the dedicated metadata panel above the file
+// list. Summary is a pure function; the *time.Location is injected so
+// callers can pass time.Local in production and a fixed zone in tests.
 package metadata
 
 import (
@@ -13,67 +13,45 @@ import (
 	"github.com/orcasauce/git-review-tui/gitcmd"
 )
 
-// HeaderLineCount returns the number of leading lines in Lines that
-// belong to the metadata header (short sha, author/date, optional tag
-// block, and the blank separator). The body content starts at index
-// HeaderLineCount(d). Returns 0 when Lines would return nil.
+// Summary returns the three rows displayed in the v5 metadata panel:
 //
-// Callers can use this to render the header as a sticky prefix so the
-// short sha can't be scrolled off the top of the message panel.
-func HeaderLineCount(d gitcmd.CommitDetail) int {
+//  1. Short sha plus filtered refs in parentheses (refs filtered via
+//     FilterRefs; same rules as Lines).
+//  2. Author name + email + formatted date (same renderer as Lines).
+//  3. Tags summary: "" when the commit has no tags, "Tags: <name>"
+//     for a single tag, "Tags: <a>, <b>" for two, and
+//     "Tags: <a>, <b> (+N more)" when more than two tags exist.
+//     Annotated-tag message bodies are not rendered.
+//
+// When d.SHA is empty the zero value [3]string{"", "", ""} is returned
+// so callers can render a blank panel without a special case.
+func Summary(d gitcmd.CommitDetail, loc *time.Location) [3]string {
 	if d.SHA == "" {
-		return 0
+		return [3]string{}
 	}
-	n := 2 // sha line + author line
-	for _, t := range d.Tags {
-		n++ // "Tags: <name>" row
-		if t.Annotated && t.Message != "" {
-			n += len(strings.Split(t.Message, "\n"))
-		}
-	}
-	n++ // blank separator
-	return n
-}
 
-// Lines returns the ordered plain-text lines for the message panel:
-// short sha [+ refs], author + date, optional Tags block, blank
-// separator, then body lines.
-func Lines(d gitcmd.CommitDetail, loc *time.Location) []string {
-	if d.SHA == "" {
-		return nil
-	}
-	var out []string
+	var out [3]string
 
 	refs := FilterRefs(d.Refs)
-	line1 := d.ShortSHA
+	out[0] = d.ShortSHA
 	if len(refs) > 0 {
-		line1 += " (" + strings.Join(refs, ", ") + ")"
-	}
-	out = append(out, line1)
-
-	out = append(out, d.AuthorName+" <"+d.AuthorEmail+">  "+formatDate(d.AuthorDateISO, d.AuthorDateRel, loc))
-
-	for i, t := range d.Tags {
-		label := "Tags:       "
-		if i > 0 {
-			label = "            "
-		}
-		name := t.Name
-		if t.Annotated {
-			name += " (annotated)"
-		}
-		out = append(out, label+name)
-		if t.Annotated && t.Message != "" {
-			for _, ml := range strings.Split(t.Message, "\n") {
-				out = append(out, "              "+ml)
-			}
-		}
+		out[0] += " (" + strings.Join(refs, ", ") + ")"
 	}
 
-	out = append(out, "")
-	if d.Body != "" {
-		out = append(out, strings.Split(d.Body, "\n")...)
+	out[1] = d.AuthorName + " <" + d.AuthorEmail + ">  " + formatDate(d.AuthorDateISO, d.AuthorDateRel, loc)
+
+	switch len(d.Tags) {
+	case 0:
+		out[2] = ""
+	case 1:
+		out[2] = "Tags: " + d.Tags[0].Name
+	case 2:
+		out[2] = "Tags: " + d.Tags[0].Name + ", " + d.Tags[1].Name
+	default:
+		out[2] = fmt.Sprintf("Tags: %s, %s (+%d more)",
+			d.Tags[0].Name, d.Tags[1].Name, len(d.Tags)-2)
 	}
+
 	return out
 }
 

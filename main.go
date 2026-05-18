@@ -28,8 +28,25 @@ import (
 type section int
 
 const (
-	sectionTop section = iota
-	sectionBottom
+	sectionLog section = iota
+	sectionFiles
+	sectionMessage
+	sectionDiff
+)
+
+// middleTab selects which panel is rendered in the small-mode middle
+// region. Only one of the three is visible at a time; Ctrl+h / Ctrl+l
+// rotates between them. The Files and Message tabs are focusable
+// (their keys move file selection / scroll the message body); the
+// Metadata tab is view-only — it has no scroll state of its own, so
+// when it is the active tab the focused section stays on the most
+// recently focused middle panel and scroll keystrokes target that.
+type middleTab int
+
+const (
+	tabMetadata middleTab = iota
+	tabFiles
+	tabMessage
 )
 
 // ActionKind is the kind of pending action queued against a commit.
@@ -176,13 +193,14 @@ type model struct {
 	fileSearchOriginIdx int
 	fileSearchOriginTop int
 
-	// Small-mode swap state. When the top row collapses to a single
-	// full-width column, it shows the log panel by default; `enter`
-	// swaps it to the message panel and `q`/`esc` swaps back. The flag
-	// persists across small-mode entry/exit so the user's chosen view
-	// survives terminal resizes. The files and diff panels are always
-	// stacked full-width below the top row, so they need no swap.
-	topShowRight bool
+	// Small-mode middle-tab state. In small mode the middle region is
+	// a tabbed container with three tabs (metadata, files, message);
+	// only the active tab's body is rendered. `Ctrl+h` / `Ctrl+l`
+	// rotate the active tab when focus is in the middle region. The
+	// value persists across small-mode entry/exit so the user's chosen
+	// view survives terminal resizes. In full mode all three middle
+	// panels are visible simultaneously and this field is ignored.
+	middleTab middleTab
 
 	// Help overlay state. When helpModalOpen is true the modal owns all
 	// keyboard input until the user dismisses it with `?`, `esc`, or `q`.
@@ -253,7 +271,8 @@ const (
 func initialModel(git *gitcmd.Client, branch, worktreeLabel string) model {
 	ldr := loader.New(loader.Config{Source: git})
 	return model{
-		active:         sectionTop,
+		active:         sectionLog,
+		middleTab:      tabFiles,
 		git:            git,
 		ldr:            ldr,
 		branch:         branch,
@@ -631,7 +650,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// churn selection / scroll state. The normal four-panel UI
 		// resumes from its prior state as soon as the terminal is resized
 		// back above the threshold.
-		if layout.Compute(m.w, m.h, len(m.files)).TooSmall {
+		if layout.Compute(m.w, m.h).TooSmall {
 			switch keyStr {
 			case "q", "ctrl+c":
 				return m, tea.Quit
@@ -678,79 +697,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+r":
 			return m.refresh()
 		case "/":
-			if m.active == sectionTop {
+			if m.commitListSection() {
 				m.openSearchPrompt()
 				return m, nil
 			}
-			if m.active == sectionBottom {
+			if m.fileListSection() {
 				m.openFileSearchPrompt()
 				return m, nil
 			}
 		case "n":
-			if m.active == sectionTop && len(m.searchMatches) > 0 {
+			if m.commitListSection() && len(m.searchMatches) > 0 {
 				m.cycleSearchMatch(1)
 				return m, m.onSelectionChanged()
 			}
-			if m.active == sectionBottom && len(m.fileSearchMatches) > 0 {
+			if m.fileListSection() && len(m.fileSearchMatches) > 0 {
 				m.cycleFileSearchMatch(1)
 				return m, m.onFileSelectionChanged()
 			}
 		case "N":
-			if m.active == sectionTop && len(m.searchMatches) > 0 {
+			if m.commitListSection() && len(m.searchMatches) > 0 {
 				m.cycleSearchMatch(-1)
 				return m, m.onSelectionChanged()
 			}
-			if m.active == sectionBottom && len(m.fileSearchMatches) > 0 {
+			if m.fileListSection() && len(m.fileSearchMatches) > 0 {
 				m.cycleFileSearchMatch(-1)
 				return m, m.onFileSelectionChanged()
 			}
 		case "q", "esc":
-			// In small mode, the first "back" step un-swaps the top
-			// section from the message panel to the log panel before
-			// falling through to the usual bottom→top→quit ladder.
-			if layout.Compute(m.w, m.h, len(m.files)).SmallMode {
-				if m.active == sectionTop && m.topShowRight {
-					m.topShowRight = false
-					return m, nil
-				}
-			}
-			// "Back" semantics: bottom → top; top → quit.
-			if m.active == sectionBottom {
-				m.active = sectionTop
+			// "Back" semantics: any non-log section steps back to log;
+			// from log, quit.
+			if m.active != sectionLog {
+				m.active = sectionLog
 				return m, nil
 			}
 			return m, tea.Quit
 		case "enter":
-			// In small mode `enter` swaps the top row to the message
-			// panel; outside small mode it activates the bottom (files)
-			// section from the top. The bottom panels are always stacked
-			// full-width, so no swap is needed there.
-			if layout.Compute(m.w, m.h, len(m.files)).SmallMode {
-				if m.active == sectionTop {
-					m.topShowRight = true
-					return m, nil
+			// `enter` advances focus along the Tab cycle. From log it
+			// activates the next region (middle in small mode, files
+			// in full mode); from the middle region it advances to
+			// the diff. From diff it's a no-op.
+			lo := layout.Compute(m.w, m.h)
+			if m.active == sectionLog {
+				if lo.SmallMode {
+					m.active = m.middleFocusSection()
+				} else {
+					m.active = sectionFiles
 				}
-			}
-			if m.active == sectionTop {
-				m.active = sectionBottom
 				return m, nil
 			}
-		case "tab":
-			if m.active == sectionTop {
-				m.active = sectionBottom
-			} else {
-				m.active = sectionTop
+			if lo.SmallMode && (m.active == sectionFiles || m.active == sectionMessage) {
+				m.active = sectionDiff
+				return m, nil
 			}
 			return m, nil
+		case "tab":
+			m.advanceTab(1)
+			return m, nil
+		case "shift+tab":
+			m.advanceTab(-1)
+			return m, nil
+		case "ctrl+h":
+			if layout.Compute(m.w, m.h).SmallMode && m.inMiddleRegion() {
+				m.rotateMiddleTab(-1)
+				return m, nil
+			}
+		case "ctrl+l":
+			if layout.Compute(m.w, m.h).SmallMode && m.inMiddleRegion() {
+				m.rotateMiddleTab(1)
+				return m, nil
+			}
 		case "ctrl+j":
-			if m.active == sectionTop && len(m.commits) > 0 {
+			if m.commitListSection() && len(m.commits) > 0 {
 				if m.selectedIdx < len(m.commits)-1 {
 					m.selectedIdx++
 				}
 				m.clampViewport()
 				return m, m.onSelectionChanged()
 			}
-			if m.active == sectionBottom && len(m.files) > 0 {
+			if m.fileListSection() && len(m.files) > 0 {
 				if m.filesSelectedIdx < len(m.files)-1 {
 					m.filesSelectedIdx++
 				}
@@ -758,14 +782,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.onFileSelectionChanged()
 			}
 		case "ctrl+k":
-			if m.active == sectionTop && len(m.commits) > 0 {
+			if m.commitListSection() && len(m.commits) > 0 {
 				if m.selectedIdx > 0 {
 					m.selectedIdx--
 				}
 				m.clampViewport()
 				return m, m.onSelectionChanged()
 			}
-			if m.active == sectionBottom && len(m.files) > 0 {
+			if m.fileListSection() && len(m.files) > 0 {
 				if m.filesSelectedIdx > 0 {
 					m.filesSelectedIdx--
 				}
@@ -773,101 +797,350 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.onFileSelectionChanged()
 			}
 		case "j":
-			if m.active == sectionTop {
+			switch m.active {
+			case sectionLog:
+				if len(m.commits) > 0 && m.selectedIdx < len(m.commits)-1 {
+					m.selectedIdx++
+					m.clampViewport()
+					return m, m.onSelectionChanged()
+				}
+				return m, nil
+			case sectionFiles:
+				if len(m.files) > 0 && m.filesSelectedIdx < len(m.files)-1 {
+					m.filesSelectedIdx++
+					m.clampFilesViewport()
+					return m, m.onFileSelectionChanged()
+				}
+				return m, nil
+			case sectionMessage:
 				m.scrollMessage(1)
 				return m, nil
-			}
-			if m.active == sectionBottom {
+			case sectionDiff:
 				m.scrollDiff(1)
 				return m, nil
 			}
 		case "k":
-			if m.active == sectionTop {
+			switch m.active {
+			case sectionLog:
+				if len(m.commits) > 0 && m.selectedIdx > 0 {
+					m.selectedIdx--
+					m.clampViewport()
+					return m, m.onSelectionChanged()
+				}
+				return m, nil
+			case sectionFiles:
+				if len(m.files) > 0 && m.filesSelectedIdx > 0 {
+					m.filesSelectedIdx--
+					m.clampFilesViewport()
+					return m, m.onFileSelectionChanged()
+				}
+				return m, nil
+			case sectionMessage:
 				m.scrollMessage(-1)
 				return m, nil
-			}
-			if m.active == sectionBottom {
+			case sectionDiff:
 				m.scrollDiff(-1)
 				return m, nil
 			}
 		case "d":
-			if m.active == sectionTop {
+			switch m.active {
+			case sectionLog:
+				return m, m.pageCommitSelection(1)
+			case sectionFiles:
+				return m, m.pageFileSelection(1)
+			case sectionMessage:
 				m.pageMessage(1)
 				return m, nil
-			}
-			if m.active == sectionBottom {
+			case sectionDiff:
 				m.pageDiff(1)
 				return m, nil
 			}
 		case "u":
-			if m.active == sectionTop {
+			switch m.active {
+			case sectionLog:
+				return m, m.pageCommitSelection(-1)
+			case sectionFiles:
+				return m, m.pageFileSelection(-1)
+			case sectionMessage:
 				m.pageMessage(-1)
 				return m, nil
-			}
-			if m.active == sectionBottom {
+			case sectionDiff:
 				m.pageDiff(-1)
 				return m, nil
 			}
 		case "G":
-			if m.active == sectionTop {
+			switch m.active {
+			case sectionLog:
+				return m, m.jumpCommitBottom()
+			case sectionFiles:
+				return m, m.jumpFileBottom()
+			case sectionMessage:
 				m.jumpMessageBottom()
 				return m, nil
-			}
-			if m.active == sectionBottom {
+			case sectionDiff:
 				m.jumpDiffBottom()
 				return m, nil
 			}
 		case "g":
-			if m.active == sectionTop {
-				if pendingG {
+			if pendingG {
+				switch m.active {
+				case sectionLog:
+					return m, m.jumpCommitTop()
+				case sectionFiles:
+					return m, m.jumpFileTop()
+				case sectionMessage:
 					m.msgScroll = 0
 					return m, nil
-				}
-				m.pendingG = true
-				return m, nil
-			}
-			if m.active == sectionBottom {
-				if pendingG {
+				case sectionDiff:
 					m.diffScroll = 0
 					return m, nil
 				}
-				m.pendingG = true
 				return m, nil
 			}
+			m.pendingG = true
+			return m, nil
 		case "h":
-			if m.active == sectionBottom {
+			if m.active == sectionDiff {
 				if m.diffHScroll > 0 {
 					m.diffHScroll--
 				}
 				return m, nil
 			}
 		case "l":
-			if m.active == sectionBottom {
+			if m.active == sectionDiff {
 				m.diffHScroll++
 				return m, nil
 			}
 		case "ctrl+d":
-			if m.active == sectionTop {
+			if m.commitListSection() {
 				return m, m.toggleDropMark()
 			}
-			if m.active == sectionBottom {
+			if m.active == sectionDiff {
 				m.jumpDiffNextHunk()
 				return m, nil
 			}
 		case "ctrl+s":
 			return m.startSave()
 		case "ctrl+u":
-			if m.active == sectionTop {
+			if m.active == sectionMessage {
 				m.pageMessage(-1)
 				return m, nil
 			}
-			if m.active == sectionBottom {
+			if m.active == sectionDiff {
 				m.jumpDiffPrevHunk()
 				return m, nil
 			}
 		}
 	}
 	return m, nil
+}
+
+// commitListSection reports whether the active section operates on the
+// commit list — sectionLog (log focused) or sectionMessage (message
+// focused, but the contextual list is still the commits). Used by
+// keys that target the commit list regardless of which of the two
+// commit-related panels has focus (e.g. `/`, `n`/`N`, `ctrl+j/k`,
+// `ctrl+d` mark-for-drop).
+func (m *model) commitListSection() bool {
+	return m.active == sectionLog || m.active == sectionMessage
+}
+
+// fileListSection reports whether the active section operates on the
+// file list — sectionFiles or sectionDiff. Symmetric to
+// commitListSection.
+func (m *model) fileListSection() bool {
+	return m.active == sectionFiles || m.active == sectionDiff
+}
+
+// inMiddleRegion reports whether the active section is one of the
+// panels that lives in the middle region of the small-mode layout
+// (files or message). Used to gate the small-mode Ctrl+h / Ctrl+l
+// middle-tab rotation.
+func (m *model) inMiddleRegion() bool {
+	return m.active == sectionFiles || m.active == sectionMessage
+}
+
+// middleFocusSection returns the scrollable section that corresponds
+// to the current middleTab. Used when entering the middle region in
+// small mode (via Tab from log or via Ctrl+h/l onto a focusable tab).
+// The metadata tab has no scroll state, so it falls back to sectionFiles
+// — the user can still cycle to it via Ctrl+h/l, but focus settles on
+// a tab where keystrokes do something useful.
+func (m *model) middleFocusSection() section {
+	switch m.middleTab {
+	case tabMessage:
+		return sectionMessage
+	default:
+		return sectionFiles
+	}
+}
+
+// advanceTab rotates m.active by one step along the Tab cycle. In full
+// mode the cycle is log → files → message → diff → log. In small mode
+// the cycle is log → middle → diff → log, where "middle" is the
+// scrollable section implied by the current middleTab.
+func (m *model) advanceTab(dir int) {
+	lo := layout.Compute(m.w, m.h)
+	if lo.SmallMode {
+		// Three logical regions: log, middle, diff. Map the current
+		// section onto one of them, advance, then map back.
+		var region int
+		switch m.active {
+		case sectionLog:
+			region = 0
+		case sectionFiles, sectionMessage:
+			region = 1
+		case sectionDiff:
+			region = 2
+		}
+		region = (region + dir + 3) % 3
+		switch region {
+		case 0:
+			m.active = sectionLog
+		case 1:
+			m.active = m.middleFocusSection()
+		case 2:
+			m.active = sectionDiff
+		}
+		return
+	}
+	order := []section{sectionLog, sectionFiles, sectionMessage, sectionDiff}
+	idx := 0
+	for i, s := range order {
+		if s == m.active {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + dir + len(order)) % len(order)
+	m.active = order[idx]
+}
+
+// rotateMiddleTab rotates middleTab by one step (metadata → files →
+// message → metadata) in the given direction. When the new tab is
+// focusable (files or message), m.active is updated to match so j/k
+// targets the visible panel. When the new tab is metadata, m.active
+// is left alone — the user is viewing metadata while keystrokes still
+// route to the last focused middle panel.
+func (m *model) rotateMiddleTab(dir int) {
+	order := []middleTab{tabMetadata, tabFiles, tabMessage}
+	idx := 0
+	for i, t := range order {
+		if t == m.middleTab {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + dir + len(order)) % len(order)
+	m.middleTab = order[idx]
+	switch m.middleTab {
+	case tabFiles:
+		m.active = sectionFiles
+	case tabMessage:
+		m.active = sectionMessage
+	}
+}
+
+// pageCommitSelection moves selectedIdx by ±half a log-body page. Used
+// by `d`/`u` when the log panel is focused. Returns a command in case
+// the new selection requires loading more commits / refreshing the
+// detail and diff panes.
+func (m *model) pageCommitSelection(dir int) tea.Cmd {
+	if len(m.commits) == 0 {
+		return nil
+	}
+	page := m.logBodyHeight() / 2
+	if page < 1 {
+		page = 1
+	}
+	target := m.selectedIdx + dir*page
+	if target < 0 {
+		target = 0
+	}
+	if target > len(m.commits)-1 {
+		target = len(m.commits) - 1
+	}
+	if target == m.selectedIdx {
+		return nil
+	}
+	m.selectedIdx = target
+	m.clampViewport()
+	return m.onSelectionChanged()
+}
+
+// pageFileSelection moves filesSelectedIdx by ±half a files-body page.
+// Used by `d`/`u` when the files panel is focused.
+func (m *model) pageFileSelection(dir int) tea.Cmd {
+	if len(m.files) == 0 {
+		return nil
+	}
+	page := m.filesBodyHeight() / 2
+	if page < 1 {
+		page = 1
+	}
+	target := m.filesSelectedIdx + dir*page
+	if target < 0 {
+		target = 0
+	}
+	if target > len(m.files)-1 {
+		target = len(m.files) - 1
+	}
+	if target == m.filesSelectedIdx {
+		return nil
+	}
+	m.filesSelectedIdx = target
+	m.clampFilesViewport()
+	return m.onFileSelectionChanged()
+}
+
+// jumpCommitTop jumps the commit selection to the first loaded commit.
+func (m *model) jumpCommitTop() tea.Cmd {
+	if len(m.commits) == 0 || m.selectedIdx == 0 {
+		return nil
+	}
+	m.selectedIdx = 0
+	m.clampViewport()
+	return m.onSelectionChanged()
+}
+
+// jumpCommitBottom jumps the commit selection to the last loaded commit.
+// Does NOT trigger another page load; the user can press `j` to load
+// more from there.
+func (m *model) jumpCommitBottom() tea.Cmd {
+	if len(m.commits) == 0 {
+		return nil
+	}
+	target := len(m.commits) - 1
+	if target == m.selectedIdx {
+		return nil
+	}
+	m.selectedIdx = target
+	m.clampViewport()
+	return m.onSelectionChanged()
+}
+
+// jumpFileTop jumps the file selection to the first file.
+func (m *model) jumpFileTop() tea.Cmd {
+	if len(m.files) == 0 || m.filesSelectedIdx == 0 {
+		return nil
+	}
+	m.filesSelectedIdx = 0
+	m.clampFilesViewport()
+	return m.onFileSelectionChanged()
+}
+
+// jumpFileBottom jumps the file selection to the last file.
+func (m *model) jumpFileBottom() tea.Cmd {
+	if len(m.files) == 0 {
+		return nil
+	}
+	target := len(m.files) - 1
+	if target == m.filesSelectedIdx {
+		return nil
+	}
+	m.filesSelectedIdx = target
+	m.clampFilesViewport()
+	return m.onFileSelectionChanged()
 }
 
 // toggleDropMark flips an ActionDrop entry on the currently-selected
@@ -1630,7 +1903,7 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.diffLoading = false
 	m.resetBinarySize()
 
-	m.active = sectionTop
+	m.active = sectionLog
 	m.clearError()
 	m.clearStatus()
 	m.pendingRefreshSHA = ""
@@ -1650,7 +1923,7 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.fileSearchOriginIdx = 0
 	m.fileSearchOriginTop = 0
 
-	m.topShowRight = false
+	m.middleTab = tabFiles
 
 	// Pending action marks belong to a specific repository state. Switching
 	// worktrees discards them entirely.
@@ -1909,7 +2182,7 @@ func (m *model) currentSelection() (sha, path string, ok bool) {
 // terminal is too small or any modal / search prompt is open so they
 // can't bypass those gates.
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return m, nil
 	}
@@ -1925,7 +2198,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if msg.Button == tea.MouseButtonWheelUp {
 			delta = -1
 		}
-		msgRect, msgVisible := messagePanelRect(lo, m.topShowRight)
+		msgRect, msgVisible := messagePanelRect(lo, m.middleTab)
 		if msgVisible && rectContains(msgRect, msg.X, msg.Y) {
 			m.scrollMessage(delta)
 			return m, nil
@@ -1939,9 +2212,8 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if msg.Action != tea.MouseActionPress {
 			return m, nil
 		}
-		logRect, logVisible := logPanelRect(lo, m.topShowRight)
-		if logVisible && rectContains(logRect, msg.X, msg.Y) {
-			row := msg.Y - logRect.Y - 1 // -1 for the title row
+		if rectContains(lo.Log, msg.X, msg.Y) {
+			row := msg.Y - lo.Log.Y - 1 // -1 for the title row
 			if row < 0 {
 				return m, nil
 			}
@@ -1949,9 +2221,9 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			if idx < 0 || idx >= len(m.commits) {
 				return m, nil
 			}
-			sectionChanged := m.active != sectionTop
+			sectionChanged := m.active != sectionLog
 			selectionChanged := idx != m.selectedIdx
-			m.active = sectionTop
+			m.active = sectionLog
 			m.selectedIdx = idx
 			m.clampViewport()
 			if selectionChanged || sectionChanged {
@@ -1959,8 +2231,9 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if rectContains(lo.Files, msg.X, msg.Y) {
-			row := msg.Y - lo.Files.Y - 1
+		filesRect, filesVisible := filesPanelRect(lo, m.middleTab)
+		if filesVisible && rectContains(filesRect, msg.X, msg.Y) {
+			row := msg.Y - filesRect.Y - 1
 			if row < 0 {
 				return m, nil
 			}
@@ -1969,7 +2242,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			selectionChanged := idx != m.filesSelectedIdx
-			m.active = sectionBottom
+			m.active = sectionFiles
 			m.filesSelectedIdx = idx
 			m.clampFilesViewport()
 			if selectionChanged {
@@ -1983,29 +2256,33 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 // messagePanelRect returns the rectangle the message panel currently
-// occupies and whether it is visible. In small mode the message panel
-// is only on screen when the top section has been swapped to its right
-// view; otherwise it occupies TopRight in full mode.
-func messagePanelRect(lo layout.Layout, topShowRight bool) (layout.Rect, bool) {
+// occupies and whether it is visible. In full mode it always occupies
+// the right column of the middle row. In small mode the middle row is
+// a tabbed container; the message is on screen only when the active
+// middle tab is tabMessage.
+func messagePanelRect(lo layout.Layout, mt middleTab) (layout.Rect, bool) {
 	if lo.SmallMode {
-		if topShowRight {
-			return lo.TopLeft, true
+		if mt == tabMessage {
+			return lo.Message, true
 		}
 		return layout.Rect{}, false
 	}
-	return lo.TopRight, true
+	return lo.Message, true
 }
 
-// logPanelRect returns the rectangle the log panel currently occupies
-// and whether it is visible. In full mode it is always TopLeft. In
-// small mode the same rectangle is shared with the message panel, so
-// the log is on screen only when the top section has not been swapped
-// to its right view.
-func logPanelRect(lo layout.Layout, topShowRight bool) (layout.Rect, bool) {
-	if lo.SmallMode && topShowRight {
+// filesPanelRect returns the rectangle the files panel currently
+// occupies and whether it is visible. In full mode it always occupies
+// the bottom of the left column of the middle row. In small mode the
+// middle row is tabbed; the files panel is on screen only when the
+// active middle tab is tabFiles.
+func filesPanelRect(lo layout.Layout, mt middleTab) (layout.Rect, bool) {
+	if lo.SmallMode {
+		if mt == tabFiles {
+			return lo.Files, true
+		}
 		return layout.Rect{}, false
 	}
-	return lo.TopLeft, true
+	return lo.Files, true
 }
 
 // rectContains reports whether (x, y) falls inside r (half-open on the
@@ -2091,7 +2368,7 @@ func (m *model) diffPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return 0
 	}
@@ -2122,25 +2399,15 @@ func (m *model) jumpMessageBottom() {
 	m.clampMsgScroll()
 }
 
-// clampMsgScroll constrains msgScroll to [0, maxMsgScroll]. msgScroll
-// only moves the body portion of the message (everything after the
-// sticky metadata header), so the max is computed against the body
-// line count and the body's visible row count.
+// clampMsgScroll constrains msgScroll to [0, maxMsgScroll]. The
+// message panel now renders only the commit body, so the max is the
+// body line count minus the panel's visible body height.
 func (m *model) clampMsgScroll() {
 	if m.msgScroll < 0 {
 		m.msgScroll = 0
 	}
 	bodyH := m.msgPanelBodyHeight()
-	header := metadata.HeaderLineCount(m.detail)
-	if header > bodyH {
-		header = bodyH
-	}
-	bodyVisibleH := bodyH - header
-	bodyLineCount := messageLineCount(m.detail) - header
-	if bodyLineCount < 0 {
-		bodyLineCount = 0
-	}
-	max := bodyLineCount - bodyVisibleH
+	max := messageLineCount(m.detail) - bodyH
 	if max < 0 {
 		max = 0
 	}
@@ -2151,24 +2418,25 @@ func (m *model) clampMsgScroll() {
 
 // msgPanelBodyHeight returns the visible body height (excluding the
 // title row) of the message panel for the current terminal size. In
-// small-mode the message panel only occupies the top rectangle when
-// the user has swapped that section to its right view; otherwise the
-// panel isn't rendered and the body height is zero.
+// small mode the message panel shares the middle row with the files
+// and metadata tabs; the panel is only rendered when the active
+// middleTab is tabMessage, in which case the height matches the
+// middle rect.
 func (m *model) msgPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return 0
 	}
 	if lo.SmallMode {
-		if m.topShowRight {
-			return lo.TopLeft.H - 1
+		if m.middleTab == tabMessage {
+			return lo.Message.H - 1
 		}
 		return 0
 	}
-	return lo.TopRight.H - 1
+	return lo.Message.H - 1
 }
 
 // maybeLoadMoreCmd returns a Log command if the selection is close
@@ -2213,11 +2481,11 @@ func (m *model) logBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return 0
 	}
-	return lo.TopLeft.H - 1 // minus title row
+	return lo.Log.H - 1 // minus title row
 }
 
 // clampFilesViewport adjusts filesViewportTop so filesSelectedIdx stays visible.
@@ -2249,7 +2517,7 @@ func (m *model) filesBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return 0
 	}
@@ -2370,6 +2638,45 @@ func renderTitleWithSpinner(text string, width int, active, loading bool, spinFr
 
 func renderTitle(text string, width int, active bool) string {
 	return renderTitleWithSpinner(text, width, active, false, 0)
+}
+
+// renderMiddleTabStrip renders the one-row tab strip shown at the top
+// of the middle region in small mode. It lists the three tab labels
+// (metadata, files, message) with the active one prefixed by "▸ " and
+// styled with activeTitleStyle; the other two are prefixed by "  " and
+// styled with inactiveTitleStyle, matching the per-panel title prefix
+// convention. The strip is padded to width cells.
+func renderMiddleTabStrip(active middleTab, width int) string {
+	type entry struct {
+		tab  middleTab
+		name string
+	}
+	entries := []entry{
+		{tabMetadata, "metadata"},
+		{tabFiles, "files"},
+		{tabMessage, "message"},
+	}
+	segs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.tab == active {
+			segs = append(segs, activeTitleStyle.Render("▸ "+e.name))
+		} else {
+			segs = append(segs, inactiveTitleStyle.Render("  "+e.name))
+		}
+	}
+	s := strings.Join(segs, "  ")
+	used := lipgloss.Width(s)
+	if used >= width {
+		raw := "▸ metadata    files    message"
+		if width <= 0 {
+			return ""
+		}
+		if len(raw) > width {
+			raw = raw[:width]
+		}
+		return raw
+	}
+	return s + strings.Repeat(" ", width-used)
 }
 
 // logPanelTitle builds the top-left panel's title, surfacing the
@@ -2593,24 +2900,39 @@ func renderLogPanel(m model, w, h int, active bool) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	lines := make([]string, 0, h)
-	lines = append(lines, renderTitle(logPanelTitle(m), w, active))
-
+	title := renderTitle(logPanelTitle(m), w, active)
 	bodyH := h - 1
 	if bodyH <= 0 {
-		return strings.Join(lines, "\n")
+		return title
 	}
+	return title + "\n" + renderLogBodyWithScrollbar(m, w, bodyH, active)
+}
 
+// renderLogBodyWithScrollbar renders the log panel body, overlaying a
+// vertical scrollbar column on the right when len(m.commits) overflows
+// the viewport. When content fits, the body uses the full inner width.
+func renderLogBodyWithScrollbar(m model, w, bodyH int, active bool) string {
+	start, length, draw := layout.ScrollbarThumb(len(m.commits), bodyH, m.viewportTop, bodyH)
+	if !draw || w < 2 {
+		return renderLogBody(m, w, bodyH, active)
+	}
+	return appendScrollbarColumn(renderLogBody(m, w-1, bodyH, active), bodyH, start, length)
+}
+
+// renderLogBody renders the log panel's body rows (no title) at the
+// given width and body height.
+func renderLogBody(m model, w, bodyH int, active bool) string {
+	if w <= 0 || bodyH <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, bodyH)
 	if len(m.commits) == 0 {
-		// Show a single placeholder line, fill rest with blanks.
-		msg := "loading…"
-		lines = append(lines, padOrTruncate(msg, w))
-		for i := 2; i < h; i++ {
+		lines = append(lines, padOrTruncate("loading…", w))
+		for i := 1; i < bodyH; i++ {
 			lines = append(lines, strings.Repeat(" ", w))
 		}
 		return strings.Join(lines, "\n")
 	}
-
 	hasPendingColumn := len(m.pendingActions) > 0
 	for row := 0; row < bodyH; row++ {
 		idx := m.viewportTop + row
@@ -2639,11 +2961,36 @@ func renderLogPanel(m model, w, h int, active bool) string {
 	return strings.Join(lines, "\n")
 }
 
-// messageLines builds the full ordered list of lines for the message
-// panel — metadata block followed by a blank separator and the body —
-// without applying any scroll offset.
+// appendScrollbarColumn appends a single-cell scrollbar column to each
+// of the bodyH rows in body. Rows in [start, start+length) get a thumb
+// cell ("█"); the rest get a space. The body is expected to be exactly
+// bodyH newline-separated rows.
+func appendScrollbarColumn(body string, bodyH, start, length int) string {
+	lines := strings.Split(body, "\n")
+	for len(lines) < bodyH {
+		lines = append(lines, "")
+	}
+	if len(lines) > bodyH {
+		lines = lines[:bodyH]
+	}
+	for i := range lines {
+		cell := " "
+		if i >= start && i < start+length {
+			cell = "█"
+		}
+		lines[i] = lines[i] + cell
+	}
+	return strings.Join(lines, "\n")
+}
+
+// messageLines returns the commit message body split into lines. The
+// dedicated metadata panel renders the sha/author/tags header, so the
+// message panel is now a pure body viewer.
 func messageLines(d gitcmd.CommitDetail) []string {
-	return metadata.Lines(d, time.Local)
+	if d.SHA == "" || d.Body == "" {
+		return nil
+	}
+	return strings.Split(d.Body, "\n")
 }
 
 // messageLineCount returns the total renderable line count for the
@@ -2719,62 +3066,69 @@ func styleSHARefsLine(line, shortSHA string) string {
 	return out
 }
 
-// renderMessagePanel renders the top-right message panel using the
-// model's currently-loaded detail and msgScroll offset. When stale is
+// renderMessagePanel renders the message panel using the model's
+// currently-loaded detail and msgScroll offset. The panel is a pure
+// body viewer — the commit's identifying metadata lives in the
+// dedicated metadata panel and is not duplicated here. When stale is
 // true the body is rendered with a single dim color (the spinner in
 // the title is the active loading affordance).
 func renderMessagePanel(m model, w, h int, active, stale bool) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	lines := make([]string, 0, h)
-	lines = append(lines, renderTitleWithSpinner("message", w, active, stale, m.spinnerFrame))
+	title := renderTitleWithSpinner("message", w, active, stale, m.spinnerFrame)
 	bodyH := h - 1
 	if bodyH <= 0 {
-		return strings.Join(lines, "\n")
+		return title
 	}
-	all := messageLines(m.detail)
-	if len(all) == 0 {
+	return title + "\n" + renderMessageBodyWithScrollbar(m, w, bodyH, stale)
+}
+
+// renderMessageBodyWithScrollbar renders the message panel body and
+// overlays a vertical scrollbar column on the right when the body
+// overflows the viewport.
+func renderMessageBodyWithScrollbar(m model, w, bodyH int, stale bool) string {
+	start, length, draw := layout.ScrollbarThumb(messageLineCount(m.detail), bodyH, m.msgScroll, bodyH)
+	if !draw || w < 2 {
+		return renderMessageBody(m, w, bodyH, stale)
+	}
+	return appendScrollbarColumn(renderMessageBody(m, w-1, bodyH, stale), bodyH, start, length)
+}
+
+// renderMessageBody renders the message panel's body rows (no title)
+// at the given width and body height. Used directly by the small-mode
+// tab strip path, where the tab strip replaces the per-panel title.
+func renderMessageBody(m model, w, bodyH int, stale bool) string {
+	if w <= 0 || bodyH <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, bodyH)
+	body := messageLines(m.detail)
+	if m.detail.SHA == "" {
 		lines = append(lines, padOrTruncate("loading…", w))
-		for i := 2; i < h; i++ {
+		for i := 1; i < bodyH; i++ {
 			lines = append(lines, strings.Repeat(" ", w))
 		}
 		return strings.Join(lines, "\n")
 	}
-	// The metadata block (sha, author, tag rows, blank separator) is a
-	// sticky panel header — it must never be scrolled off the top.
-	// msgScroll only moves the body content that follows. Without this
-	// pin the reviewer can lose all indication of which commit they are
-	// reading from a single stray scroll event.
-	header := metadata.HeaderLineCount(m.detail)
-	if header > bodyH {
-		header = bodyH
-	}
-	body := all[header:]
 	start := m.msgScroll
-	if max := len(body) - (bodyH - header); start > max {
+	if max := len(body) - bodyH; start > max {
 		start = max
 	}
 	if start < 0 {
 		start = 0
 	}
 	for row := 0; row < bodyH; row++ {
-		var raw string
-		if row < header {
-			raw = all[row]
-		} else {
-			idx := start + row - header
-			if idx >= len(body) {
-				lines = append(lines, strings.Repeat(" ", w))
-				continue
-			}
-			raw = body[idx]
+		idx := start + row
+		if idx >= len(body) {
+			lines = append(lines, strings.Repeat(" ", w))
+			continue
 		}
-		truncated := padOrTruncate(raw, w)
+		truncated := padOrTruncate(body[idx], w)
 		if stale {
 			lines = append(lines, staleStyle.Render(truncated))
 		} else {
-			lines = append(lines, styleMessageLine(truncated, m.detail.ShortSHA))
+			lines = append(lines, truncated)
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -2821,6 +3175,35 @@ func fileRowStyled(r filelist.Row) string {
 	return strings.Join(parts, "")
 }
 
+// renderMetadataPanel renders the dedicated metadata panel that sits
+// above the files panel in the middle row's left column. The panel has
+// no title row of its own; its h rows (typically MetadataContentRows)
+// are filled with the three strings returned by metadata.Summary —
+// short sha + refs, author + date, tags summary — each padded or
+// truncated to w cells.
+//
+// When the commit detail has not yet loaded (m.detail.SHA == ""), the
+// three summary rows are empty strings, so the panel renders as h
+// blank rows of width w. The row count is taken from h rather than
+// pinned at MetadataContentRows so the renderer remains valid if a
+// caller (e.g. small-mode tab body) supplies a different height.
+func renderMetadataPanel(m model, w, h int) string {
+	if w <= 0 || h <= 0 {
+		return ""
+	}
+	rows := metadata.Summary(m.detail, time.Local)
+	lines := make([]string, 0, h)
+	for i := 0; i < h; i++ {
+		var raw string
+		if i < len(rows) {
+			raw = rows[i]
+		}
+		padded := padOrTruncate(raw, w)
+		lines = append(lines, styleMessageLine(padded, m.detail.ShortSHA))
+	}
+	return strings.Join(lines, "\n")
+}
+
 // renderFilesPanel renders the bottom-left files panel for the
 // currently-loaded numstat. When stale is true the rows are rendered
 // in a single dim color.
@@ -2828,12 +3211,33 @@ func renderFilesPanel(m model, w, h int, active, stale bool) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	lines := make([]string, 0, h)
-	lines = append(lines, renderTitleWithSpinner("files", w, active, stale, m.spinnerFrame))
+	title := renderTitleWithSpinner("files", w, active, stale, m.spinnerFrame)
 	bodyH := h - 1
 	if bodyH <= 0 {
-		return strings.Join(lines, "\n")
+		return title
 	}
+	return title + "\n" + renderFilesBodyWithScrollbar(m, w, bodyH, active, stale)
+}
+
+// renderFilesBodyWithScrollbar renders the files panel body and overlays
+// a vertical scrollbar column on the right when len(m.files) overflows
+// the viewport.
+func renderFilesBodyWithScrollbar(m model, w, bodyH int, active, stale bool) string {
+	start, length, draw := layout.ScrollbarThumb(len(m.files), bodyH, m.filesViewportTop, bodyH)
+	if !draw || w < 2 {
+		return renderFilesBody(m, w, bodyH, active, stale)
+	}
+	return appendScrollbarColumn(renderFilesBody(m, w-1, bodyH, active, stale), bodyH, start, length)
+}
+
+// renderFilesBody renders the files panel's body rows (no title) at
+// the given width and body height. Used directly by the small-mode
+// tab strip path, where the tab strip replaces the per-panel title.
+func renderFilesBody(m model, w, bodyH int, active, stale bool) string {
+	if w <= 0 || bodyH <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, bodyH)
 	if len(m.files) == 0 {
 		var placeholder string
 		if m.filesSHA == "" {
@@ -2844,7 +3248,7 @@ func renderFilesPanel(m model, w, h int, active, stale bool) string {
 			placeholder = "No changes"
 		}
 		lines = append(lines, padOrTruncate(placeholder, w))
-		for i := 2; i < h; i++ {
+		for i := 1; i < bodyH; i++ {
 			lines = append(lines, strings.Repeat(" ", w))
 		}
 		return strings.Join(lines, "\n")
@@ -2901,22 +3305,54 @@ func renderDiffPanel(m model, w, h int, active, stale bool) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	lines := make([]string, 0, h)
-	lines = append(lines, renderTitleWithSpinner("diff", w, active, stale, m.spinnerFrame))
+	title := renderTitleWithSpinner("diff", w, active, stale, m.spinnerFrame)
 	bodyH := h - 1
 	if bodyH <= 0 {
-		return strings.Join(lines, "\n")
+		return title
 	}
-	// If we have prior diff content and are loading the next one, fall
-	// through to render the stale content dimmed instead of showing the
-	// "loading…" placeholder over a blank panel.
-	if placeholder, ok := diffPlaceholder(m); ok && !(stale && len(m.diff.Lines) > 0) {
-		lines = append(lines, padOrTruncate(placeholder, w))
-		for i := 2; i < h; i++ {
-			lines = append(lines, strings.Repeat(" ", w))
-		}
-		return strings.Join(lines, "\n")
+	return title + "\n" + renderDiffBodyWithScrollbar(m, w, bodyH, stale)
+}
+
+// renderDiffBodyWithScrollbar renders the diff panel body. When a
+// placeholder is in effect (no diff loaded, binary, etc.) and there is
+// no stale prior content to display, the body is rendered without a
+// scrollbar. Otherwise a vertical scrollbar column is overlaid on the
+// right when the diff content overflows the viewport.
+func renderDiffBodyWithScrollbar(m model, w, bodyH int, stale bool) string {
+	placeholder, ok := diffPlaceholder(m)
+	showStale := stale && len(m.diff.Lines) > 0
+	if ok && !showStale {
+		return renderDiffPlaceholderBody(w, bodyH, placeholder)
 	}
+	start, length, draw := layout.ScrollbarThumb(len(m.diff.Lines), bodyH, m.diffScroll, bodyH)
+	if !draw || w < 2 {
+		return renderDiffBody(m, w, bodyH, stale)
+	}
+	return appendScrollbarColumn(renderDiffBody(m, w-1, bodyH, stale), bodyH, start, length)
+}
+
+// renderDiffPlaceholderBody renders bodyH rows: the placeholder on the
+// first row, blanks below. Used when no diff content is available.
+func renderDiffPlaceholderBody(w, bodyH int, placeholder string) string {
+	if w <= 0 || bodyH <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, bodyH)
+	lines = append(lines, padOrTruncate(placeholder, w))
+	for i := 1; i < bodyH; i++ {
+		lines = append(lines, strings.Repeat(" ", w))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderDiffBody renders the diff body rows (no title) at the given
+// width and body height, using m.diffScroll as the top-of-viewport row
+// and m.diffHScroll as the horizontal offset.
+func renderDiffBody(m model, w, bodyH int, stale bool) string {
+	if w <= 0 || bodyH <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, bodyH)
 	start := m.diffScroll
 	if start < 0 {
 		start = 0
@@ -3014,34 +3450,57 @@ func (m model) View() string {
 	if m.w == 0 || m.h == 0 {
 		return ""
 	}
-	lo := layout.Compute(m.w, m.h, len(m.files))
+	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		msg := fmt.Sprintf("Terminal too small (need ≥%dx%d)", layout.MinCols, layout.MinRows)
 		body := msg + "\n" + tooSmallHintStyle.Render("q to quit")
 		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, body)
 	}
 
-	topActive := m.active == sectionTop
-	botActive := m.active == sectionBottom
+	logActive := m.active == sectionLog
+	filesActive := m.active == sectionFiles
+	msgActive := m.active == sectionMessage
+	diffActive := m.active == sectionDiff
 
-	var topRow string
+	logPanel := renderLogPanel(m, lo.Log.W, lo.Log.H, logActive)
+	var middleRow string
 	if lo.SmallMode {
-		if m.topShowRight {
-			topRow = renderMessagePanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive, m.detailLoading)
+		// The middle region is a tabbed container — row 0 is the tab
+		// strip showing the three labels (metadata / files / message),
+		// and the remaining rows render the active tab's body. The
+		// strip replaces the per-panel title row, so the body is
+		// rendered without its own title.
+		w := lo.Metadata.W
+		bodyH := lo.Metadata.H - 1
+		strip := renderMiddleTabStrip(m.middleTab, w)
+		var body string
+		switch m.middleTab {
+		case tabMetadata:
+			body = renderMetadataPanel(m, w, bodyH)
+		case tabMessage:
+			body = renderMessageBodyWithScrollbar(m, w, bodyH, m.detailLoading)
+		default:
+			body = renderFilesBodyWithScrollbar(m, w, bodyH, filesActive, m.filesLoading)
+		}
+		if bodyH > 0 {
+			middleRow = strip + "\n" + body
 		} else {
-			topRow = renderLogPanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive)
+			middleRow = strip
 		}
 	} else {
-		topLeft := renderLogPanel(m, lo.TopLeft.W, lo.TopLeft.H, topActive)
-		topRight := renderMessagePanel(m, lo.TopRight.W, lo.TopRight.H, topActive, m.detailLoading)
-		// 1-column vertical gap between the log and message panels.
-		hGap := strings.Repeat(" \n", lo.TopLeft.H-1) + " "
-		topRow = lipgloss.JoinHorizontal(lipgloss.Top, topLeft, hGap, topRight)
+		// Left column: dedicated metadata panel (sha, author/date, tags
+		// summary — 3 rows, no header) above the files panel.
+		metadataPanel := renderMetadataPanel(m, lo.Metadata.W, lo.Metadata.H)
+		filesPanel := renderFilesPanel(m, lo.Files.W, lo.Files.H, filesActive, m.filesLoading)
+		leftCol := lipgloss.JoinVertical(lipgloss.Left, metadataPanel, filesPanel)
+		rightCol := renderMessagePanel(m, lo.Message.W, lo.Message.H, msgActive, m.detailLoading)
+		// 1-column vertical gap between the left column and the message panel.
+		hGap := strings.Repeat(" \n", lo.Message.H-1) + " "
+		middleRow = lipgloss.JoinHorizontal(lipgloss.Top, leftCol, hGap, rightCol)
 	}
-	filesPanel := renderFilesPanel(m, lo.Files.W, lo.Files.H, botActive, m.filesLoading)
-	diffPanel := renderDiffPanel(m, lo.Diff.W, lo.Diff.H, botActive, m.diffLoading)
+	diffPanel := renderDiffPanel(m, lo.Diff.W, lo.Diff.H, diffActive, m.diffLoading)
 	vGap := strings.Repeat(" ", m.w)
-	base := strings.Join([]string{topRow, vGap, filesPanel, vGap, diffPanel, m.renderStatus(lo.Status.W)}, "\n")
+	base := strings.Join([]string{logPanel, vGap, middleRow, vGap, diffPanel, m.renderStatus(lo.Status.W)}, "\n")
 
 	if m.helpModalOpen {
 		return overlayCentered(base, renderHelpModal(), m.w, m.h)
