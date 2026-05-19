@@ -2122,14 +2122,25 @@ func (m *model) jumpMessageBottom() {
 	m.clampMsgScroll()
 }
 
-// clampMsgScroll constrains msgScroll to [0, maxMsgScroll] where the
-// max keeps the final body line on screen rather than scrolling past.
+// clampMsgScroll constrains msgScroll to [0, maxMsgScroll]. msgScroll
+// only moves the body portion of the message (everything after the
+// sticky metadata header), so the max is computed against the body
+// line count and the body's visible row count.
 func (m *model) clampMsgScroll() {
 	if m.msgScroll < 0 {
 		m.msgScroll = 0
 	}
 	bodyH := m.msgPanelBodyHeight()
-	max := messageLineCount(m.detail) - bodyH
+	header := metadata.HeaderLineCount(m.detail)
+	if header > bodyH {
+		header = bodyH
+	}
+	bodyVisibleH := bodyH - header
+	bodyLineCount := messageLineCount(m.detail) - header
+	if bodyLineCount < 0 {
+		bodyLineCount = 0
+	}
+	max := bodyLineCount - bodyVisibleH
 	if max < 0 {
 		max = 0
 	}
@@ -2730,20 +2741,35 @@ func renderMessagePanel(m model, w, h int, active, stale bool) string {
 		}
 		return strings.Join(lines, "\n")
 	}
+	// The metadata block (sha, author, tag rows, blank separator) is a
+	// sticky panel header — it must never be scrolled off the top.
+	// msgScroll only moves the body content that follows. Without this
+	// pin the reviewer can lose all indication of which commit they are
+	// reading from a single stray scroll event.
+	header := metadata.HeaderLineCount(m.detail)
+	if header > bodyH {
+		header = bodyH
+	}
+	body := all[header:]
 	start := m.msgScroll
-	if start > len(all)-1 {
-		start = len(all) - 1
+	if max := len(body) - (bodyH - header); start > max {
+		start = max
 	}
 	if start < 0 {
 		start = 0
 	}
 	for row := 0; row < bodyH; row++ {
-		idx := start + row
-		if idx >= len(all) {
-			lines = append(lines, strings.Repeat(" ", w))
-			continue
+		var raw string
+		if row < header {
+			raw = all[row]
+		} else {
+			idx := start + row - header
+			if idx >= len(body) {
+				lines = append(lines, strings.Repeat(" ", w))
+				continue
+			}
+			raw = body[idx]
 		}
-		raw := all[idx]
 		truncated := padOrTruncate(raw, w)
 		if stale {
 			lines = append(lines, staleStyle.Render(truncated))
