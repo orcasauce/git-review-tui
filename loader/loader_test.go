@@ -98,6 +98,25 @@ func (f *fakeSource) Diff(ctx context.Context, sha, path string) (string, error)
 	return res, nil
 }
 
+func (f *fakeSource) DiffHunks(ctx context.Context, sha, path string) (string, error) {
+	key := diffKey{SHA: sha, Path: path}
+	f.mu.Lock()
+	gate := f.diffGate
+	res := f.diffResult[key]
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return res, nil
+}
+
 func (f *fakeSource) showCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

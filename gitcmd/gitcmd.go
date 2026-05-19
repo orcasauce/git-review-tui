@@ -564,6 +564,20 @@ func parseNumstatLine(line string) (numRec, error) {
 // or "@@@" combined headers for merges); callers are expected to parse
 // it into rendered rows via the diffrender package.
 func (c *Client) Diff(ctx context.Context, sha, path string) (string, error) {
+	return c.showDiff(ctx, sha, path, true)
+}
+
+// DiffHunks returns the default-context unified diff for the given path
+// at the given sha — same as Diff, but without `-U99999`, so git's
+// default hunk-grouping heuristic determines hunk boundaries. The diff
+// renderer uses this to locate real change regions inside the full-file
+// Lines produced by Diff. For merge commits this is identical to Diff
+// (combined `--cc` output, which has no `-U` flag either).
+func (c *Client) DiffHunks(ctx context.Context, sha, path string) (string, error) {
+	return c.showDiff(ctx, sha, path, false)
+}
+
+func (c *Client) showDiff(ctx context.Context, sha, path string, fullContext bool) (string, error) {
 	parents, err := c.commitParents(ctx, sha)
 	if err != nil {
 		return "", err
@@ -578,9 +592,12 @@ func (c *Client) Diff(ctx context.Context, sha, path string) (string, error) {
 	} else {
 		args = []string{
 			"-C", c.workTreePath,
-			"show", "--format=", "-U99999", "-M", "--no-color",
-			sha, "--", path,
+			"show", "--format=", "-M", "--no-color",
 		}
+		if fullContext {
+			args = append(args, "-U99999")
+		}
+		args = append(args, sha, "--", path)
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	var stdout, stderr bytes.Buffer

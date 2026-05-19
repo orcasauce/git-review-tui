@@ -29,6 +29,7 @@ type Source interface {
 	Show(ctx context.Context, sha string) (gitcmd.CommitDetail, error)
 	NumStat(ctx context.Context, sha string) ([]gitcmd.FileStat, error)
 	Diff(ctx context.Context, sha, path string) (string, error)
+	DiffHunks(ctx context.Context, sha, path string) (string, error)
 }
 
 // Defaults; the PRD calls for ~80 ms debounce, ~64 commit-metadata
@@ -57,7 +58,7 @@ type Loader struct {
 
 	detail  *lru[string, gitcmd.CommitDetail]
 	numstat *lru[string, []gitcmd.FileStat]
-	diff    *lru[diffKey, string]
+	diff    *lru[diffKey, diffEntry]
 
 	mu            sync.Mutex
 	detailCancel  context.CancelFunc
@@ -91,13 +92,24 @@ type NumStatResult struct {
 	Cached bool
 }
 
-// DiffResult is the message produced by LoadDiff.
+// DiffResult is the message produced by LoadDiff. Raw is the full-file
+// (-U99999) unified diff used for rendering; Hunks is the same diff at
+// git's default context, used to identify real hunk boundaries inside
+// Raw. For merge commits both fields hold the same `--cc` output.
 type DiffResult struct {
 	SHA    string
 	Path   string
 	Raw    string
+	Hunks  string
 	Err    error
 	Cached bool
+}
+
+// diffEntry is the cache value for a (sha, path) pair: both the full-
+// context render diff and the default-context hunks diff.
+type diffEntry struct {
+	Raw   string
+	Hunks string
 }
 
 // New constructs a Loader from cfg. cfg.Source must be non-nil.
@@ -129,7 +141,7 @@ func New(cfg Config) *Loader {
 		debounce: deb,
 		detail:   newLRU[string, gitcmd.CommitDetail](dCap),
 		numstat:  newLRU[string, []gitcmd.FileStat](nCap),
-		diff:     newLRU[diffKey, string](fCap),
+		diff:     newLRU[diffKey, diffEntry](fCap),
 	}
 }
 
@@ -186,9 +198,9 @@ func (l *Loader) LoadNumStat(sha string) tea.Cmd {
 // path). Cache, debounce, and cancellation semantics match LoadDetail.
 func (l *Loader) LoadDiff(sha, path string) tea.Cmd {
 	key := diffKey{SHA: sha, Path: path}
-	if raw, ok := l.diff.get(key); ok {
+	if entry, ok := l.diff.get(key); ok {
 		return func() tea.Msg {
-			return DiffResult{SHA: sha, Path: path, Raw: raw, Cached: true}
+			return DiffResult{SHA: sha, Path: path, Raw: entry.Raw, Hunks: entry.Hunks, Cached: true}
 		}
 	}
 	ctx := l.swapDiffCtx()
@@ -197,11 +209,30 @@ func (l *Loader) LoadDiff(sha, path string) tea.Cmd {
 		if err := waitDebounce(ctx, deb); err != nil {
 			return DiffResult{SHA: sha, Path: path, Err: err}
 		}
-		raw, err := l.src.Diff(ctx, sha, path)
-		if err == nil {
-			l.diff.add(key, raw)
+		type result struct {
+			s   string
+			err error
 		}
-		return DiffResult{SHA: sha, Path: path, Raw: raw, Err: err}
+		rawCh := make(chan result, 1)
+		hunksCh := make(chan result, 1)
+		go func() {
+			s, err := l.src.Diff(ctx, sha, path)
+			rawCh <- result{s, err}
+		}()
+		go func() {
+			s, err := l.src.DiffHunks(ctx, sha, path)
+			hunksCh <- result{s, err}
+		}()
+		rawR := <-rawCh
+		hunksR := <-hunksCh
+		err := rawR.err
+		if err == nil {
+			err = hunksR.err
+		}
+		if err == nil {
+			l.diff.add(key, diffEntry{Raw: rawR.s, Hunks: hunksR.s})
+		}
+		return DiffResult{SHA: sha, Path: path, Raw: rawR.s, Hunks: hunksR.s, Err: err}
 	}
 }
 

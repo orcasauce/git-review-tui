@@ -19,6 +19,7 @@ import (
 	"github.com/orcasauce/git-review-tui/diffrender"
 	"github.com/orcasauce/git-review-tui/filelist"
 	"github.com/orcasauce/git-review-tui/gitcmd"
+	"github.com/orcasauce/git-review-tui/hunkstate"
 	"github.com/orcasauce/git-review-tui/layout"
 	"github.com/orcasauce/git-review-tui/loader"
 	"github.com/orcasauce/git-review-tui/metadata"
@@ -121,6 +122,14 @@ type model struct {
 	diffPath    string
 	diffScroll  int
 	diffHScroll int
+	// activeHunk is the index into m.diff.HunkStarts of the hunk the
+	// user is currently parked on. It is hunkstate.NoActiveHunk for a
+	// diff with zero hunks. Plain scrolling never updates it; n / N /
+	// ctrl+d / ctrl+u in the diff and files panels do. It is persisted
+	// per (commit, file) via hunks so returning to a file restores the
+	// last position.
+	activeHunk int
+	hunks      *hunkstate.Tracker
 	// detailLoading / filesLoading / diffLoading track whether each
 	// right/bottom panel is currently waiting on the loader. When true,
 	// the panel title shows a spinner and the body (if any prior content
@@ -278,6 +287,8 @@ func initialModel(git *gitcmd.Client, branch, worktreeLabel string) model {
 		branch:         branch,
 		worktreeLabel:  worktreeLabel,
 		pendingActions: map[string]ActionKind{},
+		activeHunk:     hunkstate.NoActiveHunk,
+		hunks:          hunkstate.New(),
 	}
 }
 
@@ -590,12 +601,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.clearError()
-		m.diff = diffrender.Parse(msg.Raw, msg.Path)
+		m.diff = diffrender.Parse(msg.Raw, msg.Hunks, msg.Path)
 		m.diffSHA = msg.SHA
 		m.diffPath = msg.Path
 		m.diffScroll = 0
 		m.diffHScroll = 0
 		m.diffLoading = false
+		m.activeHunk = m.hunks.Get(msg.SHA, msg.Path, len(m.diff.HunkStarts))
+		m.scrollToActiveHunk()
 		return m, nil
 
 	case binarySizeMsg:
@@ -714,6 +727,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cycleFileSearchMatch(1)
 				return m, m.onFileSelectionChanged()
 			}
+			if m.fileListSection() {
+				m.advanceActiveHunk(1)
+				return m, nil
+			}
 		case "N":
 			if m.commitListSection() && len(m.searchMatches) > 0 {
 				m.cycleSearchMatch(-1)
@@ -722,6 +739,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.fileListSection() && len(m.fileSearchMatches) > 0 {
 				m.cycleFileSearchMatch(-1)
 				return m, m.onFileSelectionChanged()
+			}
+			if m.fileListSection() {
+				m.advanceActiveHunk(-1)
+				return m, nil
 			}
 		case "q", "esc":
 			// "Back" semantics: any non-log section steps back to log;
@@ -774,12 +795,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clampViewport()
 				return m, m.onSelectionChanged()
 			}
-			if m.fileListSection() && len(m.files) > 0 {
-				if m.filesSelectedIdx < len(m.files)-1 {
-					m.filesSelectedIdx++
-				}
-				m.clampFilesViewport()
-				return m, m.onFileSelectionChanged()
+			if m.active == sectionFiles {
+				m.scrollDiff(1)
+				return m, nil
 			}
 		case "ctrl+k":
 			if m.commitListSection() && len(m.commits) > 0 {
@@ -789,12 +807,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clampViewport()
 				return m, m.onSelectionChanged()
 			}
-			if m.fileListSection() && len(m.files) > 0 {
-				if m.filesSelectedIdx > 0 {
-					m.filesSelectedIdx--
-				}
-				m.clampFilesViewport()
-				return m, m.onFileSelectionChanged()
+			if m.active == sectionFiles {
+				m.scrollDiff(-1)
+				return m, nil
 			}
 		case "j":
 			switch m.active {
@@ -916,7 +931,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.toggleDropMark()
 			}
 			if m.active == sectionDiff {
-				m.jumpDiffNextHunk()
+				m.advanceActiveHunk(1)
 				return m, nil
 			}
 		case "ctrl+s":
@@ -927,7 +942,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.active == sectionDiff {
-				m.jumpDiffPrevHunk()
+				m.advanceActiveHunk(-1)
 				return m, nil
 			}
 		}
@@ -976,9 +991,12 @@ func (m *model) middleFocusSection() section {
 }
 
 // advanceTab rotates m.active by one step along the Tab cycle. In full
-// mode the cycle is log → files → message → diff → log. In small mode
-// the cycle is log → middle → diff → log, where "middle" is the
-// scrollable section implied by the current middleTab.
+// mode the cycle is log → files → message → diff → log, with the
+// message section skipped when its content fits the viewport. In small
+// mode the cycle is log → middle → diff → log, where "middle" is the
+// scrollable section implied by the current middleTab; the small-mode
+// cycle is unaffected by the message-fits state because the explicit
+// middle-tab strip is the user's chosen way to land on message there.
 func (m *model) advanceTab(dir int) {
 	lo := layout.Compute(m.w, m.h)
 	if lo.SmallMode {
@@ -1004,16 +1022,46 @@ func (m *model) advanceTab(dir int) {
 		}
 		return
 	}
+	m.active = nextTabSection(m.active, dir, m.messageFitsFull(lo))
+}
+
+// nextTabSection returns the next focused section along the full-mode
+// Tab cycle (log → files → message → diff → log). When msgFits is true,
+// the message section is skipped, so the effective cycle is
+// log → files → diff → log. dir is +1 for forward, -1 for reverse.
+//
+// If the current section is sectionMessage and msgFits is true (the
+// content just shrank to fit while focus was on it), the function still
+// advances correctly: one step out of message in the requested direction.
+func nextTabSection(cur section, dir int, msgFits bool) section {
 	order := []section{sectionLog, sectionFiles, sectionMessage, sectionDiff}
 	idx := 0
 	for i, s := range order {
-		if s == m.active {
+		if s == cur {
 			idx = i
 			break
 		}
 	}
 	idx = (idx + dir + len(order)) % len(order)
-	m.active = order[idx]
+	if msgFits && order[idx] == sectionMessage {
+		idx = (idx + dir + len(order)) % len(order)
+	}
+	return order[idx]
+}
+
+// messageFitsFull reports whether the message panel's content fits
+// fully within its viewport in full mode (no scrollbar drawn). The
+// scrollbar `draw` flag is the same signal used by the message panel
+// renderer, so the tab-skip decision stays in lockstep with what the
+// user sees on screen. Returns false in small mode — the small-mode
+// middle tab strip stays on its own cycle.
+func (m *model) messageFitsFull(lo layout.Layout) bool {
+	if lo.SmallMode {
+		return false
+	}
+	bodyH := lo.Message.H - 1
+	_, _, draw := layout.ScrollbarThumb(messageLineCount(m.detail), bodyH, m.msgScroll, bodyH)
+	return !draw
 }
 
 // rotateMiddleTab rotates middleTab by one step (metadata → files →
@@ -1520,6 +1568,8 @@ func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
 		m.diffPath = ""
 		m.diffScroll = 0
 		m.diffHScroll = 0
+		m.activeHunk = hunkstate.NoActiveHunk
+		m.hunks = hunkstate.New()
 		m.detailLoading = false
 		m.filesLoading = false
 		m.diffLoading = false
@@ -1897,6 +1947,8 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.diffPath = ""
 	m.diffScroll = 0
 	m.diffHScroll = 0
+	m.activeHunk = hunkstate.NoActiveHunk
+	m.hunks = hunkstate.New()
 
 	m.detailLoading = false
 	m.filesLoading = false
@@ -1995,6 +2047,8 @@ func (m model) refresh() (tea.Model, tea.Cmd) {
 	m.diffPath = ""
 	m.diffScroll = 0
 	m.diffHScroll = 0
+	m.activeHunk = hunkstate.NoActiveHunk
+	m.hunks = hunkstate.New()
 
 	m.detailLoading = false
 	m.filesLoading = false
@@ -2085,6 +2139,7 @@ func (m *model) startDiffForSelection() tea.Cmd {
 		m.diffScroll = 0
 		m.diffHScroll = 0
 		m.diffLoading = false
+		m.activeHunk = hunkstate.NoActiveHunk
 		return m.maybeStartBinarySize()
 	}
 	// Selection moved off a binary file — drop any stale binary state so
@@ -2314,35 +2369,42 @@ func (m *model) jumpDiffBottom() {
 	m.clampDiffScroll()
 }
 
-// jumpDiffNextHunk scrolls so the next hunk start (strictly after the
-// current top line) becomes the top of the viewport. No-op when there
-// is no later hunk.
-func (m *model) jumpDiffNextHunk() {
-	for _, h := range m.diff.HunkStarts {
-		if h > m.diffScroll {
-			m.diffScroll = h
-			m.clampDiffScroll()
-			return
-		}
-	}
-}
-
-// jumpDiffPrevHunk scrolls so the previous hunk start (strictly before
-// the current top line) becomes the top of the viewport. No-op when
-// there is no earlier hunk.
-func (m *model) jumpDiffPrevHunk() {
-	target := -1
-	for _, h := range m.diff.HunkStarts {
-		if h < m.diffScroll {
-			target = h
-			continue
-		}
-		break
-	}
-	if target < 0 {
+// advanceActiveHunk steps the active hunk index by `dir` (with wrap),
+// persists the new index per (sha, path), and scrolls the diff so the
+// active hunk's first line is at the viewport top. No-op when the diff
+// has zero hunks.
+func (m *model) advanceActiveHunk(dir int) {
+	total := len(m.diff.HunkStarts)
+	if total == 0 {
+		m.activeHunk = hunkstate.NoActiveHunk
 		return
 	}
-	m.diffScroll = target
+	m.activeHunk = hunkstate.Advance(m.activeHunk, total, dir)
+	if m.diffSHA != "" {
+		m.hunks.Set(m.diffSHA, m.diffPath, m.activeHunk)
+	}
+	m.scrollToActiveHunk()
+}
+
+// scrollToActiveHunk scrolls the diff so the active hunk is framed in the
+// viewport. When the hunk fits, the remaining viewport rows are split 30/70
+// between context above and below the hunk (floored, with the rounding
+// remainder falling into the "after" share). When the hunk is taller than
+// the viewport, its first line is pinned to the top so the `@@` header
+// stays visible. No-op when there is no active hunk.
+func (m *model) scrollToActiveHunk() {
+	first, last, ok := m.diff.HunkRange(m.activeHunk)
+	if !ok {
+		return
+	}
+	bodyH := m.diffPanelBodyHeight()
+	hunkLen := last - first + 1
+	if hunkLen >= bodyH {
+		m.diffScroll = first
+	} else {
+		linesBefore := (bodyH - hunkLen) * 3 / 10
+		m.diffScroll = first - linesBefore
+	}
 	m.clampDiffScroll()
 }
 
@@ -3384,7 +3446,7 @@ func renderDiffBody(m model, w, bodyH int, stale bool) string {
 			}
 			lines = append(lines, staleStyle.Render(padOrTruncate(marker+text, w)))
 		} else {
-			lines = append(lines, m.diff.FormatLine(idx, w, m.diffHScroll))
+			lines = append(lines, m.diff.FormatLineActive(idx, w, m.diffHScroll, m.activeHunk))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -3659,7 +3721,7 @@ func renderHelpModal() string {
 			{"ctrl+s", "save pending actions"},
 		}},
 		{title: "Files (bottom)", bindings: []binding{
-			{"ctrl+j / ctrl+k", "move selection"},
+			{"ctrl+j / ctrl+k", "scroll diff down / up one line"},
 			{"/", "fuzzy search file paths"},
 			{"n / N", "next / previous search match"},
 		}},
