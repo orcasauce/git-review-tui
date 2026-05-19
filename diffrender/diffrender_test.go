@@ -399,6 +399,31 @@ func TestParse_UnknownExtensionFallsBackToPlain(t *testing.T) {
 	}
 }
 
+// TestFormatLine_HighlightedNeverContainsNewline guards against a
+// chroma quirk where single-line-comment tokens carry a trailing "\n"
+// in their token value (the lexer matches "// ... \n" as one comment
+// token). If that newline leaks through FormatLine, the diff panel
+// emits an extra terminal row, the View() output overshoots the
+// terminal height, and bubbletea drops the top row of the screen —
+// eating the panel titles.
+func TestFormatLine_HighlightedNeverContainsNewline(t *testing.T) {
+	const tsDiff = `diff --git a/a.ts b/a.ts
+index 0000000..1111111 100644
+--- a/a.ts
++++ b/a.ts
+@@ -1,2 +1,2 @@
+-        //this.#caught = caught;
++        // resolved
+`
+	r := Parse(tsDiff, "a.ts")
+	for i := range r.Lines {
+		out := r.FormatLine(i, 120, 0)
+		if strings.ContainsAny(out, "\n\r") {
+			t.Errorf("FormatLine(%d) contains a newline or CR — diff row will spill into the next terminal row: %q", i, out)
+		}
+	}
+}
+
 func TestFormatLine_HighlightedRespectsWidthAndScroll(t *testing.T) {
 	r := Parse(goDiff, "x.go")
 	// Width-truncate: a width of (gutter + 5) leaves 5 cells for marker
