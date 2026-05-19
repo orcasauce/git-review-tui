@@ -21,6 +21,12 @@
         vendorHash = "sha256-JkEFpZ3oUCV8ydg8f/yNWwkrDPIaoygPeSSvwx+0qTQ=";
         buildInputs = [ pkgs.git ];
         nativeBuildInputs = [ pkgs.git ];
+
+        preCheck = ''
+          export HOME=$(mktemp -d)
+          git config --global user.name "nobody"
+          git config --global user.email "nobody@example.com"
+        '';
       };
 
       devShells.default = pkgs.mkShell {
