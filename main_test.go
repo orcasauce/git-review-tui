@@ -213,15 +213,23 @@ func updateKey(m model, msg tea.KeyMsg) model {
 }
 
 // TestTabCycleFullMode asserts Tab cycles m.active through the four
-// scrollable panels in order: log → files → message → diff → log.
-// Shift+Tab walks the cycle in reverse. The terminal size is well
-// above SmallModeMinCols so we exercise the full-mode branch.
+// scrollable panels in order: log → files → message → diff → log
+// when the commit message overflows the message panel. Shift+Tab walks
+// the cycle in reverse. The terminal size is well above
+// SmallModeMinCols so we exercise the full-mode branch.
 func TestTabCycleFullMode(t *testing.T) {
 	const w, h = 200, 50
 	if layout.Compute(w, h).SmallMode {
 		t.Fatalf("expected full mode at %dx%d", w, h)
 	}
 	m := newRenderModel(w, h, 5, 0, 0)
+	// Make the message body long enough to overflow the message panel,
+	// so it stays a tab stop in the cycle.
+	body := make([]string, 0, h*3)
+	for i := 0; i < h*3; i++ {
+		body = append(body, "body line")
+	}
+	m.detail.Body = strings.Join(body, "\n")
 	want := []section{sectionLog, sectionFiles, sectionMessage, sectionDiff, sectionLog}
 	for i, exp := range want[1:] {
 		m = updateKey(m, tea.KeyMsg{Type: tea.KeyTab})
@@ -231,6 +239,34 @@ func TestTabCycleFullMode(t *testing.T) {
 	}
 	// Shift+Tab walks back: log → diff → message → files → log.
 	wantRev := []section{sectionDiff, sectionMessage, sectionFiles, sectionLog}
+	for i, exp := range wantRev {
+		m = updateKey(m, tea.KeyMsg{Type: tea.KeyShiftTab})
+		if m.active != exp {
+			t.Errorf("Shift+Tab step %d: m.active = %d, want %d", i+1, m.active, exp)
+		}
+	}
+}
+
+// TestTabCycleFullModeSkipsMessageWhenFits asserts that Tab and
+// Shift+Tab skip the message panel when its content fits fully in the
+// viewport (no scrollbar drawn). The user has nothing to do on a
+// non-scrollable message panel, so tab cycles past it.
+func TestTabCycleFullModeSkipsMessageWhenFits(t *testing.T) {
+	const w, h = 200, 50
+	if layout.Compute(w, h).SmallMode {
+		t.Fatalf("expected full mode at %dx%d", w, h)
+	}
+	m := newRenderModel(w, h, 5, 0, 0)
+	// Default body in newRenderModel is one line — fits comfortably.
+	want := []section{sectionFiles, sectionDiff, sectionLog, sectionFiles}
+	for i, exp := range want {
+		m = updateKey(m, tea.KeyMsg{Type: tea.KeyTab})
+		if m.active != exp {
+			t.Errorf("Tab step %d: m.active = %d, want %d", i+1, m.active, exp)
+		}
+	}
+	// Reverse: log → diff → files → log → diff.
+	wantRev := []section{sectionLog, sectionDiff, sectionFiles, sectionLog}
 	for i, exp := range wantRev {
 		m = updateKey(m, tea.KeyMsg{Type: tea.KeyShiftTab})
 		if m.active != exp {
@@ -564,6 +600,95 @@ func TestFilesPanelScrollbarWhenOverflowing(t *testing.T) {
 	}
 	if thumbCount == 0 {
 		t.Errorf("expected scrollbar thumb in files body, got none")
+	}
+}
+
+// TestNextTabSection covers full-mode tab cycling with and without
+// the "message panel fits" skip. The small-mode cycle is handled
+// separately in advanceTab and is not exercised here.
+func TestNextTabSection(t *testing.T) {
+	cases := []struct {
+		name    string
+		cur     section
+		dir     int
+		msgFits bool
+		want    section
+	}{
+		// Forward, message does not fit — full cycle.
+		{"fwd/no-fit/log", sectionLog, 1, false, sectionFiles},
+		{"fwd/no-fit/files", sectionFiles, 1, false, sectionMessage},
+		{"fwd/no-fit/message", sectionMessage, 1, false, sectionDiff},
+		{"fwd/no-fit/diff", sectionDiff, 1, false, sectionLog},
+		// Forward, message fits — skip message.
+		{"fwd/fits/log", sectionLog, 1, true, sectionFiles},
+		{"fwd/fits/files", sectionFiles, 1, true, sectionDiff},
+		{"fwd/fits/diff", sectionDiff, 1, true, sectionLog},
+		// Reverse, message does not fit.
+		{"rev/no-fit/log", sectionLog, -1, false, sectionDiff},
+		{"rev/no-fit/files", sectionFiles, -1, false, sectionLog},
+		{"rev/no-fit/message", sectionMessage, -1, false, sectionFiles},
+		{"rev/no-fit/diff", sectionDiff, -1, false, sectionMessage},
+		// Reverse, message fits — skip message.
+		{"rev/fits/log", sectionLog, -1, true, sectionDiff},
+		{"rev/fits/files", sectionFiles, -1, true, sectionLog},
+		{"rev/fits/diff", sectionDiff, -1, true, sectionFiles},
+		// Transitional: focus is on sectionMessage when msgFits flips
+		// to true (e.g., commit detail shrank). One step in each
+		// direction lands on a neighbor — message itself is not
+		// re-entered.
+		{"fwd/fits/from-message", sectionMessage, 1, true, sectionDiff},
+		{"rev/fits/from-message", sectionMessage, -1, true, sectionFiles},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := nextTabSection(c.cur, c.dir, c.msgFits)
+			if got != c.want {
+				t.Errorf("nextTabSection(%d, %d, %v) = %d, want %d", c.cur, c.dir, c.msgFits, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNextTabSectionSymmetry asserts that reverse undoes forward when
+// the "fits" flag is stable, for every starting section that the
+// cycle can land on. This is the property the user feels as
+// "shift+tab takes me back where I was."
+func TestNextTabSectionSymmetry(t *testing.T) {
+	for _, fits := range []bool{false, true} {
+		starts := []section{sectionLog, sectionFiles, sectionDiff}
+		if !fits {
+			starts = append(starts, sectionMessage)
+		}
+		for _, s := range starts {
+			fwd := nextTabSection(s, 1, fits)
+			back := nextTabSection(fwd, -1, fits)
+			if back != s {
+				t.Errorf("fits=%v: from %d forward→%d, reverse→%d (expected %d)", fits, s, fwd, back, s)
+			}
+		}
+	}
+}
+
+// TestNextTabSectionMessageNeverSkippedWhenOverflow asserts the
+// invariant that sectionMessage is always reachable via tab when its
+// content overflows the panel. Cycling forward from each starting
+// section (with msgFits=false) must visit sectionMessage exactly once
+// before returning to the start.
+func TestNextTabSectionMessageNeverSkippedWhenOverflow(t *testing.T) {
+	starts := []section{sectionLog, sectionFiles, sectionMessage, sectionDiff}
+	for _, s := range starts {
+		visited := map[section]int{}
+		cur := s
+		for i := 0; i < 4; i++ {
+			cur = nextTabSection(cur, 1, false)
+			visited[cur]++
+		}
+		if visited[sectionMessage] != 1 {
+			t.Errorf("start=%d: message visited %d times in a full cycle (want 1)", s, visited[sectionMessage])
+		}
+		if cur != s {
+			t.Errorf("start=%d: after 4 forward steps, ended on %d (want %d)", s, cur, s)
+		}
 	}
 }
 

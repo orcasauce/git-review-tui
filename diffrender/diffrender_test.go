@@ -28,7 +28,7 @@ index 0000000..1111111 100644
 `
 
 func TestParse_LineCountsAndKinds(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	if got, want := len(r.Lines), 5; got != want {
 		t.Fatalf("len(Lines) = %d, want %d: %+v", got, want, r.Lines)
 	}
@@ -41,7 +41,7 @@ func TestParse_LineCountsAndKinds(t *testing.T) {
 }
 
 func TestParse_HunkStartsAndAtAtStripped(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	if got, want := len(r.HunkStarts), 1; got != want {
 		t.Fatalf("len(HunkStarts) = %d, want %d", got, want)
 	}
@@ -56,7 +56,7 @@ func TestParse_HunkStartsAndAtAtStripped(t *testing.T) {
 }
 
 func TestParse_GutterLineNumbers(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	// Expected old/new pairs per line:
 	//   one    (ctx)   old=1 new=1
 	//   -two            old=2 new=0
@@ -89,7 +89,7 @@ func TestParse_MultipleHunks(t *testing.T) {
 +new-ten
  eleven
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	if len(r.HunkStarts) != 2 {
 		t.Fatalf("HunkStarts = %v, want 2 entries", r.HunkStarts)
 	}
@@ -116,7 +116,7 @@ func TestParse_StripsNoNewlineMarker(t *testing.T) {
 \ No newline at end of file
 +new
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	if len(r.Lines) != 2 {
 		t.Fatalf("len(Lines) = %d, want 2 (no-newline marker should be stripped): %+v",
 			len(r.Lines), r.Lines)
@@ -127,7 +127,7 @@ func TestParse_StripsNoNewlineMarker(t *testing.T) {
 }
 
 func TestFormatLine_StylingOnAddAndDel(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	addIdx := -1
 	delIdx := -1
 	ctxIdx := -1
@@ -179,7 +179,7 @@ func TestFormatLine_GutterHasLineNumbers(t *testing.T) {
 +TEN
 +eleven
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	if r.OldW != 2 || r.NewW != 2 {
 		t.Fatalf("OldW/NewW = %d/%d, want 2/2", r.OldW, r.NewW)
 	}
@@ -207,7 +207,7 @@ func TestFormatLine_HorizontalScroll(t *testing.T) {
 -ABCDEFGHIJ
 +abcdefghij
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	out := r.FormatLine(1, 40, 4)
 	// hScroll=4 should drop the first 4 chars of "abcdefghij" → "efghij".
 	if !strings.Contains(out, "efghij") {
@@ -219,7 +219,7 @@ func TestFormatLine_HorizontalScroll(t *testing.T) {
 }
 
 func TestParse_EmptyInput(t *testing.T) {
-	r := Parse("", "")
+	r := Parse("", "", "")
 	if len(r.Lines) != 0 {
 		t.Errorf("expected 0 lines, got %d", len(r.Lines))
 	}
@@ -229,7 +229,7 @@ func TestParse_EmptyInput(t *testing.T) {
 }
 
 func TestParse_HunkStarts_SingleHunk(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	if got, want := r.HunkStarts, []int{0}; len(got) != len(want) || got[0] != want[0] {
 		t.Errorf("HunkStarts = %v, want %v", got, want)
 	}
@@ -252,7 +252,7 @@ func TestParse_HunkStarts_ManyHunks(t *testing.T) {
 -g
 +G
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	wantStarts := []int{0, 2, 5, 7}
 	if len(r.HunkStarts) != len(wantStarts) {
 		t.Fatalf("HunkStarts = %v, want %v", r.HunkStarts, wantStarts)
@@ -279,7 +279,7 @@ func TestParse_HunkStarts_AllContext(t *testing.T) {
  two
  three
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	if len(r.HunkStarts) != 1 || r.HunkStarts[0] != 0 {
 		t.Errorf("HunkStarts = %v, want [0]", r.HunkStarts)
 	}
@@ -301,7 +301,7 @@ func TestParse_HunkStarts_AllChanges(t *testing.T) {
 +TWO
 +THREE
 `
-	r := Parse(in, "")
+	r := Parse(in, "", "")
 	if len(r.HunkStarts) != 1 || r.HunkStarts[0] != 0 {
 		t.Errorf("HunkStarts = %v, want [0]", r.HunkStarts)
 	}
@@ -333,8 +333,8 @@ const goDiff = `diff --git a/x.go b/x.go
 `
 
 func TestParse_SyntaxHighlightingForKnownLanguage(t *testing.T) {
-	plain := Parse(goDiff, "")
-	hl := Parse(goDiff, "x.go")
+	plain := Parse(goDiff, "", "")
+	hl := Parse(goDiff, "", "x.go")
 	if len(plain.Lines) != len(hl.Lines) {
 		t.Fatalf("line count diverged between plain and highlighted: %d vs %d",
 			len(plain.Lines), len(hl.Lines))
@@ -382,8 +382,8 @@ func TestParse_SyntaxHighlightingForKnownLanguage(t *testing.T) {
 func TestParse_UnknownExtensionFallsBackToPlain(t *testing.T) {
 	// `.zzzzz` is not a real language; chroma should miss and we should
 	// emit the same bytes as the plain (filename="") path.
-	hl := Parse(sampleDiff, "weird.zzzzz")
-	plain := Parse(sampleDiff, "")
+	hl := Parse(sampleDiff, "", "weird.zzzzz")
+	plain := Parse(sampleDiff, "", "")
 	for i := range hl.Lines {
 		if hl.Lines[i].segs != nil {
 			t.Errorf("Lines[%d].segs should be nil for unknown extension", i)
@@ -410,7 +410,7 @@ index 0000000..1111111 100644
 -        //this.#caught = caught;
 +        // resolved
 `
-	r := Parse(tsDiff, "a.ts")
+	r := Parse(tsDiff, "", "a.ts")
 	for i := range r.Lines {
 		out := r.FormatLine(i, 120, 0)
 		if strings.ContainsAny(out, "\n\r") {
@@ -420,7 +420,7 @@ index 0000000..1111111 100644
 }
 
 func TestFormatLine_HighlightedRespectsWidthAndScroll(t *testing.T) {
-	r := Parse(goDiff, "x.go")
+	r := Parse(goDiff, "", "x.go")
 	// Width-truncate: a width of (gutter + 5) leaves 5 cells for marker
 	// + body; the output should not exceed that printable length.
 	w := r.GutterRenderWidth() + 5
@@ -476,7 +476,7 @@ func findAddDelCtxIdx(r Result) (add, del, ctx int) {
 }
 
 func TestFormatLine_AddRowBodyBackground(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	addIdx, _, _ := findAddDelCtxIdx(r)
 	if addIdx < 0 {
 		t.Fatalf("sampleDiff has no add row")
@@ -492,7 +492,7 @@ func TestFormatLine_AddRowBodyBackground(t *testing.T) {
 }
 
 func TestFormatLine_DelRowBodyBackground(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	_, delIdx, _ := findAddDelCtxIdx(r)
 	if delIdx < 0 {
 		t.Fatalf("sampleDiff has no del row")
@@ -508,7 +508,7 @@ func TestFormatLine_DelRowBodyBackground(t *testing.T) {
 }
 
 func TestFormatLine_AddRowGutterBand(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	addIdx, _, _ := findAddDelCtxIdx(r)
 	if addIdx < 0 {
 		t.Fatalf("sampleDiff has no add row")
@@ -521,7 +521,7 @@ func TestFormatLine_AddRowGutterBand(t *testing.T) {
 }
 
 func TestFormatLine_DelRowGutterBand(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	_, delIdx, _ := findAddDelCtxIdx(r)
 	if delIdx < 0 {
 		t.Fatalf("sampleDiff has no del row")
@@ -534,7 +534,7 @@ func TestFormatLine_DelRowGutterBand(t *testing.T) {
 }
 
 func TestFormatLine_ContextRowHasNoBanding(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	_, _, ctxIdx := findAddDelCtxIdx(r)
 	if ctxIdx < 0 {
 		t.Fatalf("sampleDiff has no context row")
@@ -557,7 +557,7 @@ func TestFormatLine_ContextRowHasNoBanding(t *testing.T) {
 // width that leaves zero body cells, and confirm the gutter band is
 // still rendered and the body region is empty.
 func TestFormatLine_GutterOnlyAtZeroBodyWidth(t *testing.T) {
-	r := Parse(sampleDiff, "")
+	r := Parse(sampleDiff, "", "")
 	addIdx, _, _ := findAddDelCtxIdx(r)
 	if addIdx < 0 {
 		t.Fatalf("sampleDiff has no add row")
@@ -576,7 +576,7 @@ func TestFormatLine_GutterOnlyAtZeroBodyWidth(t *testing.T) {
 }
 
 func TestFormatLine_HighlightedAddRowChromaFgOverBodyBg(t *testing.T) {
-	r := Parse(goDiff, "x.go")
+	r := Parse(goDiff, "", "x.go")
 	addIdx, _, _ := findAddDelCtxIdx(r)
 	if addIdx < 0 {
 		t.Fatalf("goDiff has no add row")

@@ -59,10 +59,16 @@ type Line struct {
 // Result is the parsed diff.
 type Result struct {
 	Lines []Line
-	// HunkStarts holds, for each "@@" hunk header in the input, the
-	// index into Lines at which that hunk's first content line lives.
-	// Used by the diff panel to jump to next / previous change.
+	// HunkStarts and HunkEnds hold, for each real change-region in the
+	// diff, the indices into Lines of the first and last changed (+/-)
+	// line that belongs to that hunk. Hunks are identified using git's
+	// default-context diff output (passed as hunksDiff to Parse), so
+	// boundaries match what `git diff` would naturally show — Lines
+	// itself is built from a full-file `-U99999` diff for rendering.
+	// Used by the diff panel to jump to next / previous change and to
+	// frame the active hunk in the viewport.
 	HunkStarts []int
+	HunkEnds   []int
 	// OldW / NewW are the column widths needed to render the gutter for
 	// the largest line numbers seen.
 	OldW int
@@ -72,18 +78,27 @@ type Result struct {
 	highlighted bool
 }
 
-// Parse parses a raw unified diff into a Result. The filename is used
-// only as a hint for chroma's language detection (typically the path
-// the diff applies to); an empty string disables syntax highlighting.
-func Parse(raw, filename string) Result {
+// Parse parses a raw unified diff into a Result. raw is the full-file
+// diff (typically `git show -U99999`) used to build the Lines slice;
+// hunksDiff is the same change at git's default context width, used
+// only to identify real hunk boundaries inside Lines. When hunksDiff is
+// empty, or when the diff is a combined merge diff (`--cc`, headers
+// prefixed with `@@@`), hunk boundaries fall back to the `@@` markers
+// in raw. The filename is used only as a hint for chroma's language
+// detection; an empty string disables syntax highlighting.
+func Parse(raw, hunksDiff, filename string) Result {
 	var lines []Line
-	var hunks []int
 	var oldN, newN int
 	inHunk := false
+	hasCombined := false
+	rawHunkStarts := []int{}
 	for _, ln := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(ln, "@@@") {
+			hasCombined = true
+		}
 		if strings.HasPrefix(ln, "@@") {
 			oldN, newN = parseHunkHeader(ln)
-			hunks = append(hunks, len(lines))
+			rawHunkStarts = append(rawHunkStarts, len(lines))
 			inHunk = true
 			continue
 		}
@@ -110,7 +125,19 @@ func Parse(raw, filename string) Result {
 			newN++
 		}
 	}
-	r := Result{Lines: lines, HunkStarts: hunks}
+	var hunkStarts, hunkEnds []int
+	if hasCombined || hunksDiff == "" {
+		// Combined-diff path: raw is already a small-context --cc diff,
+		// so each `@@@` header marks a real hunk. Take the header's
+		// position in Lines as both start and end; combined-diff hunk
+		// extents aren't precisely modelled here, but framing on the
+		// hunk header is still a useful anchor.
+		hunkStarts = rawHunkStarts
+		hunkEnds = append([]int(nil), rawHunkStarts...)
+	} else {
+		hunkStarts, hunkEnds = extractHunkBounds(lines, hunksDiff)
+	}
+	r := Result{Lines: lines, HunkStarts: hunkStarts, HunkEnds: hunkEnds}
 	for _, l := range lines {
 		if l.OldNum > r.OldW {
 			r.OldW = l.OldNum
@@ -129,6 +156,98 @@ func Parse(raw, filename string) Result {
 		}
 	}
 	return r
+}
+
+// extractHunkBounds walks a default-context unified diff (hunksDiff) to
+// find each hunk's first and last changed (+/-) lines, then maps those
+// to indices in lines (the full-file Lines slice built from raw). The
+// result is two parallel slices: starts[i] and ends[i] bound the i-th
+// real hunk inside lines. Hunks with no changed lines (rare but
+// possible — e.g., context-only) are skipped.
+func extractHunkBounds(lines []Line, hunksDiff string) (starts, ends []int) {
+	type anchor struct {
+		isAdd  bool
+		oldNum int
+		newNum int
+	}
+	var firsts, lasts []anchor
+	var oldN, newN int
+	inHunk := false
+	haveFirst := false
+	var first, last anchor
+	flush := func() {
+		if haveFirst {
+			firsts = append(firsts, first)
+			lasts = append(lasts, last)
+			haveFirst = false
+		}
+	}
+	for _, ln := range strings.Split(hunksDiff, "\n") {
+		if strings.HasPrefix(ln, "@@") {
+			flush()
+			oldN, newN = parseHunkHeader(ln)
+			inHunk = true
+			continue
+		}
+		if !inHunk || ln == "" {
+			continue
+		}
+		if ln[0] == '\\' {
+			continue
+		}
+		switch ln[0] {
+		case '+':
+			a := anchor{isAdd: true, newNum: newN}
+			if !haveFirst {
+				first = a
+				haveFirst = true
+			}
+			last = a
+			newN++
+		case '-':
+			a := anchor{isAdd: false, oldNum: oldN}
+			if !haveFirst {
+				first = a
+				haveFirst = true
+			}
+			last = a
+			oldN++
+		case ' ':
+			oldN++
+			newN++
+		}
+	}
+	flush()
+
+	find := func(from int, a anchor) int {
+		for i := from; i < len(lines); i++ {
+			if a.isAdd {
+				if lines[i].Kind == Add && lines[i].NewNum == a.newNum {
+					return i
+				}
+			} else {
+				if lines[i].Kind == Del && lines[i].OldNum == a.oldNum {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+	cursor := 0
+	for i := range firsts {
+		s := find(cursor, firsts[i])
+		if s < 0 {
+			continue
+		}
+		e := find(s, lasts[i])
+		if e < 0 {
+			e = s
+		}
+		starts = append(starts, s)
+		ends = append(ends, e)
+		cursor = e
+	}
+	return starts, ends
 }
 
 func parseHunkHeader(s string) (oldN, newN int) {
@@ -302,6 +421,66 @@ func styleFor(tt chroma.TokenType) lipgloss.Style {
 // add/del rows.
 func (r Result) GutterRenderWidth() int {
 	return r.OldW + 1 + r.NewW + 1
+}
+
+// HunkRange returns the first and last line indices of the hunk at
+// position activeHunk — the first and last changed (+/-) lines of that
+// hunk inside Lines. Returns ok=false when activeHunk is out of range.
+func (r Result) HunkRange(activeHunk int) (first, last int, ok bool) {
+	if activeHunk < 0 || activeHunk >= len(r.HunkStarts) {
+		return 0, 0, false
+	}
+	first = r.HunkStarts[activeHunk]
+	if activeHunk < len(r.HunkEnds) {
+		last = r.HunkEnds[activeHunk]
+	} else {
+		last = first
+	}
+	if last < first {
+		last = first
+	}
+	return first, last, true
+}
+
+// FormatLineActive renders Lines[idx] like FormatLine and additionally
+// wraps the result with an SGR overline when idx is the first line of
+// activeHunk and/or an SGR underline when it is the last. The boundary
+// color (SGR 58) reflects the line's Kind: add→256-color 83, del→
+// 256-color 203, context→default (no SGR 58 emitted). activeHunk < 0
+// disables the decoration.
+func (r Result) FormatLineActive(idx, width, hScroll, activeHunk int) string {
+	s := r.FormatLine(idx, width, hScroll)
+	first, last, ok := r.HunkRange(activeHunk)
+	if !ok {
+		return s
+	}
+	isFirst := idx == first
+	isLast := idx == last
+	if !isFirst && !isLast {
+		return s
+	}
+	var active strings.Builder
+	if isFirst {
+		active.WriteString("\x1b[53m")
+	}
+	if isLast {
+		active.WriteString("\x1b[4m")
+	}
+	switch r.Lines[idx].Kind {
+	case Add:
+		active.WriteString("\x1b[58;2;95;149;95m")
+	case Del:
+		active.WriteString("\x1b[58;5;203m")
+	}
+	activeSGR := active.String()
+	if activeSGR == "" {
+		return s
+	}
+	// Re-emit the active-state SGR after every embedded reset so the
+	// overline/underline survive lipgloss's per-segment "\x1b[0m" that
+	// would otherwise clear them mid-line.
+	s = strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+activeSGR)
+	return activeSGR + s + "\x1b[0m"
 }
 
 // FormatLine renders Lines[idx] to a single ANSI-styled string of
