@@ -1,14 +1,26 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+	"github.com/orcasauce/git-review-tui/filefilter"
 	"github.com/orcasauce/git-review-tui/gitcmd"
 	"github.com/orcasauce/git-review-tui/layout"
+	"github.com/orcasauce/git-review-tui/loader"
 )
+
+func init() {
+	// Force a 256-color profile so style.Render() emits ANSI escapes
+	// even when tests run without a TTY — required for tests that
+	// assert on the dim styling applied to non-matching commit rows.
+	lipgloss.SetColorProfile(termenv.ANSI256)
+}
 
 // fakeCommit builds a minimal Commit good enough for log-panel rendering.
 func fakeCommit(i int) gitcmd.Commit {
@@ -33,17 +45,22 @@ func newRenderModel(w, h, ncommits, selectedIdx, viewportTop int) model {
 		{Status: "M", Path: "metadata/metadata.go"},
 		{Status: "A", Path: "newfile.go"},
 	}
+	visible := make([]int, len(files))
+	for i := range files {
+		visible[i] = i
+	}
 	m := model{
 		w: w, h: h,
-		active:         sectionLog,
-		middleTab:      tabFiles,
-		commits:        commits,
-		selectedIdx:    selectedIdx,
-		viewportTop:    viewportTop,
-		branch:         "main",
-		pendingActions: map[string]ActionKind{},
-		files:          files,
-		filesSHA:       commits[selectedIdx].SHA,
+		active:            sectionLog,
+		middleTab:         tabFiles,
+		commits:           commits,
+		selectedIdx:       selectedIdx,
+		viewportTop:       viewportTop,
+		branch:            "main",
+		pendingActions:    map[string]ActionKind{},
+		files:             files,
+		fileFilterVisible: visible,
+		filesSHA:          commits[selectedIdx].SHA,
 		detail: gitcmd.CommitDetail{
 			SHA:           commits[selectedIdx].SHA,
 			ShortSHA:      commits[selectedIdx].ShortSHA,
@@ -585,10 +602,13 @@ func TestFilesPanelScrollbarWhenOverflowing(t *testing.T) {
 	lo := layout.Compute(w, h)
 	bodyH := lo.Files.H - 1
 	files := make([]gitcmd.FileStat, bodyH*3)
+	visible := make([]int, len(files))
 	for i := range files {
 		files[i] = gitcmd.FileStat{Status: "M", Path: "path/to/file"}
+		visible[i] = i
 	}
 	m.files = files
+	m.fileFilterVisible = visible
 
 	panel := renderFilesPanel(m, lo.Files.W, lo.Files.H, true, false)
 	rows := strings.Split(panel, "\n")
@@ -710,5 +730,618 @@ func TestDiffPanelNoScrollbarOnPlaceholder(t *testing.T) {
 		if containsThumb(r) {
 			t.Errorf("row %d unexpectedly contains thumb glyph on placeholder: %q", i, r)
 		}
+	}
+}
+
+// TestFileFilterIntegration_HidesNonMatchingRows asserts that a
+// committed file-filter Expr is applied end-to-end: the files panel
+// renders only matching paths, the title row carries the expression
+// and a (visible/total) count, and the selection re-anchors to the
+// nearest visible original index.
+func TestFileFilterIntegration_HidesNonMatchingRows(t *testing.T) {
+	const w, h = 200, 50
+	m := newRenderModel(w, h, 5, 0, 0)
+	m.files = []gitcmd.FileStat{
+		{Status: "M", Path: "main.go"},
+		{Status: "M", Path: "docs/intro.md"},
+		{Status: "A", Path: "internal/util.go"},
+		{Status: "M", Path: "README.md"},
+	}
+	// Start selection on docs/intro.md (orig idx 1) so we can observe
+	// the nearest-visible clamp behavior.
+	m.filesSelectedIdx = 1
+	visible := make([]int, len(m.files))
+	for i := range m.files {
+		visible[i] = i
+	}
+	m.fileFilterVisible = visible
+
+	expr, err := filefilter.Parse("*.go")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	m.fileFilterExpr = expr
+	m.recomputeVisibleFiles(1)
+
+	if got, want := len(m.fileFilterVisible), 2; got != want {
+		t.Fatalf("visible count = %d, want %d (only .go files)", got, want)
+	}
+	if origIdx := m.fileFilterVisible[0]; origIdx != 0 {
+		t.Errorf("first visible orig idx = %d, want 0 (main.go)", origIdx)
+	}
+	if origIdx := m.fileFilterVisible[1]; origIdx != 2 {
+		t.Errorf("second visible orig idx = %d, want 2 (internal/util.go)", origIdx)
+	}
+	// docs/intro.md (orig idx 1) is hidden, so the nearest visible by
+	// original index is internal/util.go (orig idx 2) → visible pos 1.
+	if got, want := m.filesSelectedIdx, 1; got != want {
+		t.Errorf("filesSelectedIdx after clamp = %d, want %d", got, want)
+	}
+
+	lo := layout.Compute(w, h)
+	panel := renderFilesPanel(m, lo.Files.W, lo.Files.H, true, false)
+	if !strings.Contains(panel, "main.go") {
+		t.Errorf("panel should show main.go, got %q", panel)
+	}
+	if !strings.Contains(panel, "internal/util.go") {
+		t.Errorf("panel should show internal/util.go, got %q", panel)
+	}
+	if strings.Contains(panel, "README.md") || strings.Contains(panel, "intro.md") {
+		t.Errorf("panel should not show .md files, got %q", panel)
+	}
+	// The filter expression and (N/M) counter now live in the bottom
+	// status panel, not the files header. The styled renderer paints
+	// `*` and `.go` in different colors, so strip ANSI before asserting.
+	status := stripANSI(m.renderStatus(lo.Status.W))
+	if !strings.Contains(status, "*.go") {
+		t.Errorf("status row should contain expression *.go, got %q", status)
+	}
+	if !strings.Contains(status, "(2/4)") {
+		t.Errorf("status row should contain (2/4) count, got %q", status)
+	}
+}
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
+
+// TestFileFilterIntegration_EmptyFilteredSetRendersBlank asserts that
+// when a filter is active and no files match, the body renders blank
+// rows rather than the "No changes" placeholder.
+func TestFileFilterIntegration_EmptyFilteredSetRendersBlank(t *testing.T) {
+	const w, h = 200, 50
+	m := newRenderModel(w, h, 5, 0, 0)
+	m.files = []gitcmd.FileStat{
+		{Status: "M", Path: "README.md"},
+		{Status: "M", Path: "docs/intro.md"},
+	}
+	visible := []int{0, 1}
+	m.fileFilterVisible = visible
+	m.filesSelectedIdx = 0
+
+	expr, err := filefilter.Parse("*.go")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	m.fileFilterExpr = expr
+	m.recomputeVisibleFiles(-1)
+
+	if got := len(m.fileFilterVisible); got != 0 {
+		t.Fatalf("visible count = %d, want 0", got)
+	}
+	lo := layout.Compute(w, h)
+	panel := renderFilesPanel(m, lo.Files.W, lo.Files.H, true, false)
+	if strings.Contains(panel, "No changes") {
+		t.Errorf("filter-empty pane should not show No changes placeholder, got %q", panel)
+	}
+	if strings.Contains(panel, "README.md") || strings.Contains(panel, "intro.md") {
+		t.Errorf("filter-empty pane should not show file paths, got %q", panel)
+	}
+}
+
+// TestCommitMatchesFileFilter covers the per-commit match helper: a
+// commit matches iff at least one of its files matches the Expr,
+// evaluated against both Path and OldPath so renames are honoured on
+// either side.
+func TestCommitMatchesFileFilter(t *testing.T) {
+	exprGo, _ := filefilter.Parse("*.go")
+	exprMd, _ := filefilter.Parse("*.md")
+	exprRename, _ := filefilter.Parse("legacy/*.go")
+	files := []gitcmd.FileStat{
+		{Status: "M", Path: "main.go"},
+		{Status: "M", Path: "README.md"},
+	}
+	if !commitMatchesFileFilter(files, exprGo) {
+		t.Errorf("*.go should match a commit with main.go")
+	}
+	if !commitMatchesFileFilter(files, exprMd) {
+		t.Errorf("*.md should match a commit with README.md")
+	}
+	if commitMatchesFileFilter(files, exprRename) {
+		t.Errorf("legacy/*.go should not match a commit with no legacy/ files")
+	}
+	// Rename: new path doesn't match but old path does.
+	renamed := []gitcmd.FileStat{
+		{Status: "R", Path: "current/util.go", OldPath: "legacy/util.go"},
+	}
+	if !commitMatchesFileFilter(renamed, exprRename) {
+		t.Errorf("legacy/*.go should match via OldPath on a rename")
+	}
+	// Empty file set never matches.
+	if commitMatchesFileFilter(nil, exprGo) {
+		t.Errorf("nil file set should never match")
+	}
+}
+
+// TestIsCommitDimmed_EmptyFilterNeverDims asserts that with no active
+// file filter, no commit is dimmed regardless of the cached match map.
+func TestIsCommitDimmed_EmptyFilterNeverDims(t *testing.T) {
+	m := newRenderModel(200, 50, 3, 0, 0)
+	m.commitFilterMatch = map[string]bool{"abc": false}
+	if m.isCommitDimmed("abc") {
+		t.Errorf("with empty filter, no commit should be dimmed")
+	}
+}
+
+// TestIsCommitDimmed_UnknownShaNotDimmed asserts that a commit whose
+// numstat has not yet been evaluated is rendered bright (not dim), so
+// commits brighten "in place" as their data arrives rather than
+// starting dim and brightening when matches are found.
+func TestIsCommitDimmed_UnknownShaNotDimmed(t *testing.T) {
+	m := newRenderModel(200, 50, 3, 0, 0)
+	expr, _ := filefilter.Parse("*.go")
+	m.fileFilterExpr = expr
+	m.commitFilterMatch = map[string]bool{}
+	if m.isCommitDimmed("unseen-sha") {
+		t.Errorf("unknown sha should not be dimmed (unevaluated, not no-match)")
+	}
+}
+
+// TestIsCommitDimmed_NoMatchDims asserts a commit whose numstat has
+// been evaluated and contains no matching files is dimmed, while one
+// with at least one matching file is not.
+func TestIsCommitDimmed_NoMatchDims(t *testing.T) {
+	m := newRenderModel(200, 50, 3, 0, 0)
+	expr, _ := filefilter.Parse("*.go")
+	m.fileFilterExpr = expr
+	m.commitFilterMatch = map[string]bool{
+		"match-sha":   true,
+		"nomatch-sha": false,
+	}
+	if m.isCommitDimmed("match-sha") {
+		t.Errorf("commit with at least one match should not be dimmed")
+	}
+	if !m.isCommitDimmed("nomatch-sha") {
+		t.Errorf("commit with zero matches should be dimmed")
+	}
+}
+
+// TestLogPanel_DimNonMatchingCommit asserts that a commit recorded as
+// non-matching renders the log row with the commit-dim color, while a
+// matching commit at a different row does not. The two test rows are
+// chosen so neither is the selected row (which always wins styling).
+func TestLogPanel_DimNonMatchingCommit(t *testing.T) {
+	const w, h = 200, 50
+	m := newRenderModel(w, h, 4, 0, 0)
+	// Give each commit a unique SHA so the dim map can distinguish them.
+	for i := range m.commits {
+		m.commits[i].SHA = strings.Repeat(string(rune('a'+i)), 40)
+		m.commits[i].ShortSHA = m.commits[i].SHA[:7]
+	}
+	expr, _ := filefilter.Parse("*.go")
+	m.fileFilterExpr = expr
+	// Row 0 is the selected row; pick row 1 (match) and row 2 (no match).
+	m.commitFilterMatch = map[string]bool{
+		m.commits[1].SHA: true,
+		m.commits[2].SHA: false,
+	}
+
+	lo := layout.Compute(w, h)
+	panel := renderLogPanel(m, lo.Log.W, lo.Log.H, true)
+	rows := strings.Split(panel, "\n")
+	// Row 0 = title, then row 1/2/3 are body indices 0/1/2.
+	const dimSeq = "38;5;240"
+	matchRow := rows[2]
+	dimRow := rows[3]
+	if strings.Contains(matchRow, dimSeq) {
+		t.Errorf("matching commit row should not contain dim escape %q: %q", dimSeq, matchRow)
+	}
+	if !strings.Contains(dimRow, dimSeq) {
+		t.Errorf("non-matching commit row should contain dim escape %q: %q", dimSeq, dimRow)
+	}
+}
+
+// TestNumStatResult_UpdatesCommitDimMap asserts that when a
+// NumStatResult arrives for any commit (including ones the user has
+// not selected), the commit-dim map is populated, satisfying story 27:
+// commits dim as their numstat data arrives.
+func TestNumStatResult_UpdatesCommitDimMap(t *testing.T) {
+	m := newRenderModel(200, 50, 2, 0, 0)
+	for i := range m.commits {
+		m.commits[i].SHA = strings.Repeat(string(rune('a'+i)), 40)
+		m.commits[i].ShortSHA = m.commits[i].SHA[:7]
+	}
+	expr, _ := filefilter.Parse("*.go")
+	m.fileFilterExpr = expr
+	// The selected commit (index 0) gets a numstat that does NOT match.
+	selSHA := m.commits[0].SHA
+	m.filesSHA = ""
+	updated, _ := m.Update(loader.NumStatResult{
+		SHA:   selSHA,
+		Files: []gitcmd.FileStat{{Status: "M", Path: "README.md"}},
+	})
+	m = updated.(model)
+	got, ok := m.commitFilterMatch[selSHA]
+	if !ok {
+		t.Fatalf("dim map missing entry for %s after NumStatResult", selSHA)
+	}
+	if got {
+		t.Errorf("commit with no .go files should be recorded as non-matching")
+	}
+}
+
+// TestFileFilterPrompt_PersistsAcrossSelectionAndRefresh asserts the
+// committed file filter is preserved when fresh NumStatResults arrive
+// (commit selection change, ctrl+r refresh) — the filter expression
+// stays set and the visible list is recomputed against the new files.
+func TestFileFilterPrompt_PersistsAcrossNumStatResults(t *testing.T) {
+	m := newRenderModel(200, 50, 5, 0, 0)
+	expr, _ := filefilter.Parse("*.go")
+	m.fileFilterExpr = expr
+	m.recomputeVisibleFiles(-1)
+
+	// Simulate a brand-new file set arriving from a different commit.
+	m.files = []gitcmd.FileStat{
+		{Status: "A", Path: "cmd/tool/main.go"},
+		{Status: "M", Path: "CHANGELOG.md"},
+	}
+	m.recomputeVisibleFiles(-1)
+	if got := len(m.fileFilterVisible); got != 1 {
+		t.Fatalf("after refresh, visible count = %d, want 1", got)
+	}
+	if m.fileFilterExpr.String() != "*.go" {
+		t.Errorf("filter expr lost: %q", m.fileFilterExpr.String())
+	}
+}
+
+// TestFileFilter_BugRepro_HEAD_25bdcec reproduces the user-reported
+// filter anomaly against the captured fixture of the orcasauce/
+// git-review-tui repo at HEAD commit 25bdcec, which touches exactly
+// three files:
+//
+//	loader/loader.go
+//	main.go
+//	main_test.go
+//
+// Reported failures:
+//
+//  1. Filter `main` reported "5 matches" in the files-pane indicator —
+//     impossible if the indicator's N is `len(fileFilterVisible)` over
+//     a 3-file commit. Expected for a bare-basename glob: zero matches
+//     (none of the basenames equal "main" exactly).
+//  2. Filter `main.go` reported "no matches" despite `main.go` being
+//     present in the commit. Expected: exactly one match, the `main.go`
+//     entry (basename equals the pattern).
+//
+// This test drives recomputeVisibleFiles end-to-end against the real
+// file slice for that commit and asserts the visible set. If the bug
+// is in the matcher / parser, this test will fail. If the test passes,
+// the matcher is innocent and the live failure must originate from
+// model state interactions (e.g. stale `m.files` during the loader
+// debounce window when commit selection changes).
+func TestFileFilter_BugRepro_HEAD_25bdcec(t *testing.T) {
+	const headSHA = "25bdcec19af6992ac0b5ff47e68df1303fa658a7"
+
+	fx := loadRepoFixture(t, "testdata/fixtures/bug-25bdcec.json")
+	if fx.Head != headSHA {
+		t.Fatalf("fixture head = %s, want %s", fx.Head, headSHA)
+	}
+	files := numStatFor(t, fx, headSHA)
+	if got := len(files); got != 3 {
+		t.Fatalf("fixture HEAD has %d files, want 3 (loader/loader.go, main.go, main_test.go)", got)
+	}
+	wantPaths := map[string]bool{
+		"loader/loader.go": true,
+		"main.go":          true,
+		"main_test.go":     true,
+	}
+	for _, f := range files {
+		if !wantPaths[f.Path] {
+			t.Fatalf("unexpected file in HEAD fixture: %q", f.Path)
+		}
+	}
+
+	m := newRenderModel(200, 50, 5, 0, 0)
+	m.files = files
+	m.filesSHA = headSHA
+
+	type expect struct {
+		query       string
+		visibleN    int
+		visiblePath string // when visibleN == 1
+	}
+	cases := []expect{
+		// `main` has no glob metacharacters, so it substring-matches
+		// the basename: main.go and main_test.go both contain "main".
+		// loader/loader.go does not.
+		{query: "main", visibleN: 2},
+		// `main.go` substring-matches the basename "main.go" only.
+		{query: "main.go", visibleN: 1, visiblePath: "main.go"},
+		// Sanity baseline: `*.go` is a basename glob matching every .go.
+		{query: "*.go", visibleN: 3},
+		// Negated plain string excludes anything whose basename
+		// contains "main".
+		{query: "!main", visibleN: 1, visiblePath: "loader/loader.go"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			expr, err := filefilter.Parse(tc.query)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.query, err)
+			}
+			m.fileFilterExpr = expr
+			m.recomputeVisibleFiles(-1)
+
+			if got := len(m.fileFilterVisible); got != tc.visibleN {
+				var visiblePaths []string
+				for _, idx := range m.fileFilterVisible {
+					visiblePaths = append(visiblePaths, m.files[idx].Path)
+				}
+				t.Fatalf("filter %q: visible = %d %v, want %d",
+					tc.query, got, visiblePaths, tc.visibleN)
+			}
+			if tc.visibleN == 1 {
+				gotPath := m.files[m.fileFilterVisible[0]].Path
+				if gotPath != tc.visiblePath {
+					t.Errorf("filter %q: visible path = %q, want %q",
+						tc.query, gotPath, tc.visiblePath)
+				}
+			}
+		})
+	}
+}
+
+
+func TestDeleteLastFilterToken(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty", "", ""},
+		{"single token", "foo", ""},
+		{"single token with trailing whitespace", "foo  ", ""},
+		{"two tokens", "foo, bar", "foo"},
+		{"two tokens tight comma", "foo,bar", "foo"},
+		// `foo,` parses to a single token "foo" at [0,3]; the function
+		// then trims that span's leading whitespace/comma and ends up
+		// at cut=0, clearing input. This is arguably surprising (the
+		// user might expect to land on "foo") but it is the current
+		// behavior — captured here so any future change is intentional.
+		{"trailing comma clears all", "foo,", ""},
+		{"trailing comma + space clears all", "foo, ", ""},
+		{"three tokens", "foo, bar, baz", "foo, bar"},
+		{"regex tail with comma inside", "foo, /a,b/", "foo"},
+		{"regex tail preserves earlier regex", "/x,y/, bar", "/x,y/"},
+		{"unclosed quote falls back to last literal comma", `foo, "bar`, "foo"},
+		{"unclosed quote with no comma clears all", `"bar`, ""},
+		{"negated token", "foo, !bar", "foo"},
+		{"quoted comma-containing token", `foo, "a,b"`, "foo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deleteLastFilterToken(tc.input)
+			if got != tc.want {
+				t.Errorf("deleteLastFilterToken(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdvanceSelectedSkippingDimmed exercises the rule that
+// keyboard navigation skips over consecutive dimmed (filter-known
+// non-matching) commits, but never skips commits whose numstat hasn't
+// loaded yet — those count as "unknown" and stop the cursor so it
+// doesn't run away from the user while data is still streaming.
+func TestAdvanceSelectedSkippingDimmed(t *testing.T) {
+	mkCommits := func(shas ...string) []gitcmd.Commit {
+		out := make([]gitcmd.Commit, len(shas))
+		for i, s := range shas {
+			out[i] = gitcmd.Commit{SHA: s, ShortSHA: s[:7]}
+		}
+		return out
+	}
+	mkExpr := func(t *testing.T, q string) filefilter.Expr {
+		t.Helper()
+		e, err := filefilter.Parse(q)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", q, err)
+		}
+		return e
+	}
+
+	type tc struct {
+		name        string
+		commits     []gitcmd.Commit
+		match       map[string]bool
+		startIdx    int
+		dir         int
+		wantMoved   bool
+		wantNewIdx  int
+	}
+	commits := mkCommits(
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"cccccccccccccccccccccccccccccccccccccccc",
+		"dddddddddddddddddddddddddddddddddddddddd",
+		"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	)
+	cases := []tc{
+		{
+			name:    "skips run of dimmed forward",
+			commits: commits,
+			match: map[string]bool{
+				commits[0].SHA: true,
+				commits[1].SHA: false, // dim
+				commits[2].SHA: false, // dim
+				commits[3].SHA: true,
+				commits[4].SHA: true,
+			},
+			startIdx: 0, dir: 1, wantMoved: true, wantNewIdx: 3,
+		},
+		{
+			name:    "skips run of dimmed backward",
+			commits: commits,
+			match: map[string]bool{
+				commits[0].SHA: true,
+				commits[1].SHA: false,
+				commits[2].SHA: false,
+				commits[3].SHA: true,
+			},
+			startIdx: 3, dir: -1, wantMoved: true, wantNewIdx: 0,
+		},
+		{
+			name:    "unknown commit stops the cursor (not skipped)",
+			commits: commits,
+			match: map[string]bool{
+				commits[0].SHA: true,
+				// commits[1] has no entry -> unknown, treated as not-dim.
+				commits[2].SHA: true,
+			},
+			startIdx: 0, dir: 1, wantMoved: true, wantNewIdx: 1,
+		},
+		{
+			name:    "no movement when at the edge with no eligible target",
+			commits: commits,
+			match: map[string]bool{
+				commits[0].SHA: true,
+				commits[1].SHA: false,
+				commits[2].SHA: false,
+				commits[3].SHA: false,
+				commits[4].SHA: false,
+			},
+			startIdx: 0, dir: 1, wantMoved: false, wantNewIdx: 0,
+		},
+		{
+			name: "no movement at start going up",
+			commits: commits,
+			match: map[string]bool{},
+			startIdx: 0, dir: -1, wantMoved: false, wantNewIdx: 0,
+		},
+		{
+			name: "bogus dir returns false",
+			commits: commits,
+			match: map[string]bool{},
+			startIdx: 2, dir: 0, wantMoved: false, wantNewIdx: 2,
+		},
+		{
+			name:    "empty commits returns false",
+			commits: nil,
+			match:   map[string]bool{},
+			startIdx: 0, dir: 1, wantMoved: false, wantNewIdx: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := model{
+				commits:           c.commits,
+				selectedIdx:       c.startIdx,
+				commitFilterMatch: c.match,
+				fileFilterExpr:    mkExpr(t, "*.go"),
+			}
+			moved := m.advanceSelectedSkippingDimmed(c.dir)
+			if moved != c.wantMoved {
+				t.Errorf("moved = %v, want %v", moved, c.wantMoved)
+			}
+			if m.selectedIdx != c.wantNewIdx {
+				t.Errorf("selectedIdx = %d, want %d", m.selectedIdx, c.wantNewIdx)
+			}
+		})
+	}
+}
+
+// TestFileFilterPrompt_CtrlW_DeletesLastToken asserts that ctrl+w
+// while the prompt is open drops the trailing comma-separated token
+// from the in-progress input and re-parses, leaving the remaining
+// tokens (and any prior debounced "last valid" expression) intact.
+func TestFileFilterPrompt_CtrlW_DeletesLastToken(t *testing.T) {
+	m := newRenderModel(200, 50, 5, 0, 0)
+	m.openFileFilterPrompt()
+	m.fileFilterPromptInput = "foo, bar"
+	m.reparseFileFilterPrompt()
+
+	updated, _ := m.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlW})
+	mm := updated.(model)
+	if mm.fileFilterPromptInput != "foo" {
+		t.Errorf("after ctrl+w, input = %q, want %q", mm.fileFilterPromptInput, "foo")
+	}
+	if !mm.fileFilterPromptActive {
+		t.Error("ctrl+w should not close the prompt")
+	}
+
+	updated2, _ := mm.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlW})
+	mm2 := updated2.(model)
+	if mm2.fileFilterPromptInput != "" {
+		t.Errorf("after second ctrl+w, input = %q, want \"\"", mm2.fileFilterPromptInput)
+	}
+
+	// On empty input ctrl+w is a no-op (state unchanged, still open).
+	updated3, _ := mm2.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlW})
+	mm3 := updated3.(model)
+	if mm3.fileFilterPromptInput != "" {
+		t.Errorf("ctrl+w on empty should be a no-op, got %q", mm3.fileFilterPromptInput)
+	}
+	if !mm3.fileFilterPromptActive {
+		t.Error("ctrl+w on empty should leave prompt open")
+	}
+}
+
+// TestFileFilterPrompt_CtrlK_ClearsInput asserts that ctrl+k while
+// the prompt is open wipes the input and the debounce state so a
+// stale "last valid" Expr from a prior keystroke can't leak through
+// into the next reparse.
+func TestFileFilterPrompt_CtrlK_ClearsInput(t *testing.T) {
+	m := newRenderModel(200, 50, 5, 0, 0)
+	m.openFileFilterPrompt()
+	m.fileFilterPromptInput = "foo, bar, baz"
+	m.reparseFileFilterPrompt()
+	// Force the debounce state to be non-nil so we can verify ctrl+k
+	// clears it. fileFilterLastValid is normally only populated when a
+	// later edit invalidates a previously-valid expression.
+	_, parsedTokens, _ := filefilter.ParsePartial("foo")
+	if len(parsedTokens) == 0 {
+		t.Fatal("setup: expected one parsed token")
+	}
+	t0 := parsedTokens[0]
+	m.fileFilterLastValid = []*filefilter.Token{&t0}
+	m.fileFilterInvalidSince = []time.Time{time.Now()}
+
+	updated, _ := m.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlU})
+	// ctrl+u is not bound — make sure it does NOT clear (only ctrl+k does).
+	mm := updated.(model)
+	if mm.fileFilterPromptInput != "foo, bar, baz" {
+		t.Errorf("ctrl+u should not be bound; input changed to %q", mm.fileFilterPromptInput)
+	}
+
+	updated2, _ := m.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlK})
+	mm2 := updated2.(model)
+	if mm2.fileFilterPromptInput != "" {
+		t.Errorf("after ctrl+k, input = %q, want \"\"", mm2.fileFilterPromptInput)
+	}
+	if mm2.fileFilterLastValid != nil {
+		t.Error("ctrl+k should clear fileFilterLastValid")
+	}
+	if mm2.fileFilterInvalidSince != nil {
+		t.Error("ctrl+k should clear fileFilterInvalidSince")
+	}
+	if !mm2.fileFilterPromptActive {
+		t.Error("ctrl+k should not close the prompt")
+	}
+
+	// On empty input ctrl+k is a no-op.
+	updated3, _ := mm2.updateFileFilterPrompt(tea.KeyMsg{Type: tea.KeyCtrlK})
+	mm3 := updated3.(model)
+	if mm3.fileFilterPromptInput != "" {
+		t.Errorf("ctrl+k on empty should be a no-op, got %q", mm3.fileFilterPromptInput)
 	}
 }

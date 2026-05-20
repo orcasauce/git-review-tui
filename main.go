@@ -17,13 +17,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/orcasauce/git-review-tui/diffrender"
+	"github.com/orcasauce/git-review-tui/filefilter"
 	"github.com/orcasauce/git-review-tui/filelist"
 	"github.com/orcasauce/git-review-tui/gitcmd"
 	"github.com/orcasauce/git-review-tui/hunkstate"
 	"github.com/orcasauce/git-review-tui/layout"
 	"github.com/orcasauce/git-review-tui/loader"
 	"github.com/orcasauce/git-review-tui/metadata"
-	"github.com/orcasauce/git-review-tui/searchfilter"
 )
 
 type section int
@@ -178,29 +178,45 @@ type model struct {
 	wtList      []gitcmd.Worktree
 	wtModalIdx  int
 
-	// Commit-list search state. searchActive is true while the user is
-	// typing a query; once `enter` confirms (or `esc` cancels) it flips
-	// back to false but the captured `searchMatches` stay around so
-	// `n`/`N` can cycle through them. searchOriginIdx / searchOriginTop
-	// remember the selection at the time the prompt opened so `esc`
-	// restores it without disturbing the rest of the UI.
-	searchActive    bool
-	searchQuery     string
-	searchMatches   []int
-	searchMatchIdx  int
-	searchOriginIdx int
-	searchOriginTop int
+	// File-list filter state. The file filter hides non-matching files
+	// entirely. `fileFilterExpr` is the committed expression; while the
+	// prompt is open `fileFilterPromptInput` is what the user is typing
+	// and `fileFilterPromptExpr` is its live-parsed Expr, used to render
+	// the file list before Enter commits the change. The visible-list
+	// indices are cached in `fileFilterVisible` (rebuilt when the files
+	// load or the active expression changes); both `filesSelectedIdx`
+	// and `filesViewportTop` are positions inside this visible list.
+	//
+	// `fileFilterPromptOrigIdx` / `fileFilterPromptOrigTop` snapshot the
+	// pre-prompt visible-list selection so `esc` can restore it. The
+	// filter persists across commit selection and `ctrl+r` refresh.
+	fileFilterPromptActive  bool
+	fileFilterPromptInput   string
+	fileFilterPromptExpr    filefilter.Expr
+	fileFilterPromptOrigIdx int
+	fileFilterPromptOrigTop int
+	fileFilterExpr          filefilter.Expr
+	fileFilterVisible       []int
 
-	// Files-list search state. Mirrors the commit-list search state but
-	// is scoped to the files panel for the currently-loaded commit.
-	// fileSearchOriginIdx / fileSearchOriginTop capture the file
-	// selection at the moment the prompt opened so `esc` can restore it.
-	fileSearchActive    bool
-	fileSearchQuery     string
-	fileSearchMatches   []int
-	fileSearchMatchIdx  int
-	fileSearchOriginIdx int
-	fileSearchOriginTop int
+	// Per-position regex debounce cache used while the filter prompt is
+	// open. fileFilterLastValid[i] holds the most recent valid Token at
+	// position i, and fileFilterInvalidSince[i] records when position i
+	// transitioned from valid to invalid (zero when currently valid or
+	// never valid). Together they implement stories 17–18: a regex that
+	// becomes invalid keeps applying for `fileFilterDebounce` (500ms),
+	// and a regex that has never been valid contributes nothing. Cleared
+	// on prompt open / close / commit so each editing session starts fresh.
+	fileFilterLastValid    []*filefilter.Token
+	fileFilterInvalidSince []time.Time
+
+	// commitFilterMatch maps commit SHA → whether at least one of that
+	// commit's files matches the active file filter. Absence means the
+	// commit has not been evaluated (numstat not yet loaded). Computed on
+	// filter submit from the loader's cached numstats, and updated as new
+	// NumStatResults arrive so commits dim progressively as the user
+	// pages through the log (PRD stories 25–27). Cleared on filter
+	// clear, ctrl+r refresh, and worktree switch.
+	commitFilterMatch map[string]bool
 
 	// Small-mode middle-tab state. In small mode the middle region is
 	// a tabbed container with three tabs (metadata, files, message);
@@ -496,18 +512,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.clampViewport()
-		// New page may contain additional matches for an active search;
-		// re-rank and re-anchor searchMatchIdx onto the current selection.
-		if m.searchQuery != "" {
-			m.recomputeSearchMatches()
-			m.searchMatchIdx = -1
-			for i, idx := range m.searchMatches {
-				if idx == m.selectedIdx {
-					m.searchMatchIdx = i
-					break
-				}
-			}
-		}
 		// On first load, kick off the detail + numstat fetches for the
 		// initial selection so the message and files panels populate
 		// without requiring any keystrokes.
@@ -515,7 +519,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sha := m.commits[m.selectedIdx].SHA
 			m.detailLoading = true
 			m.filesLoading = true
-			return m, tea.Batch(m.ldr.LoadDetail(sha), m.ldr.LoadNumStat(sha), m.startSpinnerCmd())
+			cmds := []tea.Cmd{m.ldr.LoadDetail(sha), m.ldr.LoadNumStat(sha), m.startSpinnerCmd()}
+			if pref := m.nextPrefetchCmd(); pref != nil {
+				cmds = append(cmds, pref)
+			}
+			return m, tea.Batch(cmds...)
+		}
+		// Newly arrived commits (pagination) need dim-state population too.
+		if pref := m.nextPrefetchCmd(); pref != nil {
+			return m, pref
 		}
 		return m, nil
 
@@ -552,8 +564,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Err != nil {
+			if msg.Prefetch {
+				// Background prefetch failures are ignored: the user has
+				// no action to take and the chain should keep going so
+				// later commits still get their dim state evaluated.
+				return m, m.nextPrefetchCmd()
+			}
 			m.filesLoading = false
 			return m, m.raiseError(msg.Err)
+		}
+		// Update commit-row dim state for any incoming numstat while a
+		// filter is active. This is how commits dim progressively as the
+		// user navigates the log (PRD story 27): when the user selects
+		// a commit not previously evaluated, its numstat arrives here
+		// and is recorded in the dim map.
+		if !m.fileFilterExpr.IsEmpty() {
+			if m.commitFilterMatch == nil {
+				m.commitFilterMatch = make(map[string]bool)
+			}
+			m.commitFilterMatch[msg.SHA] = commitMatchesFileFilter(msg.Files, m.fileFilterExpr)
+		}
+		if msg.Prefetch {
+			// Prefetch results only populate the dim map; they never
+			// drive the files pane. Chain the next prefetch.
+			return m, m.nextPrefetchCmd()
 		}
 		if len(m.commits) == 0 || msg.SHA != m.commits[m.selectedIdx].SHA {
 			return m, nil
@@ -564,20 +598,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filesSelectedIdx = 0
 		m.filesViewportTop = 0
 		m.filesLoading = false
-		m.fileSearchActive = false
-		m.fileSearchQuery = ""
-		m.fileSearchMatches = nil
-		m.fileSearchMatchIdx = -1
-		m.fileSearchOriginIdx = 0
-		m.fileSearchOriginTop = 0
-		// Restore a refresh-preserved file selection by path if it
-		// still exists in the new files list. Consumed once; subsequent
-		// numstat results (e.g. after navigating to another commit)
-		// behave normally.
+		// The file filter persists across commit selection and refresh,
+		// so the active Expr applies immediately to the new file set.
+		m.recomputeVisibleFiles(-1)
+		// Restore a refresh-preserved file selection by path if it still
+		// exists and is visible under the active filter. Consumed once.
 		if m.pendingRefreshPath != "" {
-			for i, f := range m.files {
-				if f.Path == m.pendingRefreshPath {
-					m.filesSelectedIdx = i
+			for visIdx, origIdx := range m.fileFilterVisible {
+				if m.files[origIdx].Path == m.pendingRefreshPath {
+					m.filesSelectedIdx = visIdx
 					m.clampFilesViewport()
 					break
 				}
@@ -650,6 +679,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case fileFilterDebounceMsg:
+		// Debounce timer fired: re-run the live parse so any expired
+		// prior-valid regex is dropped. No-op when the prompt is no
+		// longer open (commit/cancel happened before the tick fired).
+		if !m.fileFilterPromptActive {
+			return m, nil
+		}
+		cmd := m.reparseFileFilterPrompt()
+		return m, cmd
+
 	case rebaseDoneMsg:
 		return m.handleRebaseDone(msg)
 
@@ -684,14 +723,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.rebaseState != rebaseStateIdle {
 			return m.updateRebasePopup(keyStr)
 		}
-		// The commit-search prompt likewise consumes every keystroke
-		// while it is open. `n`/`N` are handled below (after confirmation)
-		// alongside the rest of the navigation keys.
-		if m.searchActive {
-			return m.updateSearchPrompt(msg)
-		}
-		if m.fileSearchActive {
-			return m.updateFileSearchPrompt(msg)
+		if m.fileFilterPromptActive {
+			return m.updateFileFilterPrompt(msg)
 		}
 		// Any key other than a follow-up `g` cancels a pending `gg`.
 		pendingG := m.pendingG
@@ -710,36 +743,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+r":
 			return m.refresh()
 		case "/":
-			if m.commitListSection() {
-				m.openSearchPrompt()
-				return m, nil
-			}
-			if m.fileListSection() {
-				m.openFileSearchPrompt()
-				return m, nil
-			}
+			m.openFileFilterPrompt()
+			return m, nil
 		case "n":
-			if m.commitListSection() && len(m.searchMatches) > 0 {
-				m.cycleSearchMatch(1)
-				return m, m.onSelectionChanged()
-			}
-			if m.fileListSection() && len(m.fileSearchMatches) > 0 {
-				m.cycleFileSearchMatch(1)
-				return m, m.onFileSelectionChanged()
-			}
 			if m.fileListSection() {
 				m.advanceActiveHunk(1)
 				return m, nil
 			}
 		case "N":
-			if m.commitListSection() && len(m.searchMatches) > 0 {
-				m.cycleSearchMatch(-1)
-				return m, m.onSelectionChanged()
-			}
-			if m.fileListSection() && len(m.fileSearchMatches) > 0 {
-				m.cycleFileSearchMatch(-1)
-				return m, m.onFileSelectionChanged()
-			}
 			if m.fileListSection() {
 				m.advanceActiveHunk(-1)
 				return m, nil
@@ -789,11 +800,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "ctrl+j":
 			if m.commitListSection() && len(m.commits) > 0 {
-				if m.selectedIdx < len(m.commits)-1 {
-					m.selectedIdx++
+				if m.advanceSelectedSkippingDimmed(1) {
+					m.clampViewport()
+					return m, m.onSelectionChanged()
 				}
-				m.clampViewport()
-				return m, m.onSelectionChanged()
+				return m, nil
 			}
 			if m.active == sectionFiles {
 				m.scrollDiff(1)
@@ -801,11 +812,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "ctrl+k":
 			if m.commitListSection() && len(m.commits) > 0 {
-				if m.selectedIdx > 0 {
-					m.selectedIdx--
+				if m.advanceSelectedSkippingDimmed(-1) {
+					m.clampViewport()
+					return m, m.onSelectionChanged()
 				}
-				m.clampViewport()
-				return m, m.onSelectionChanged()
+				return m, nil
 			}
 			if m.active == sectionFiles {
 				m.scrollDiff(-1)
@@ -814,14 +825,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "j":
 			switch m.active {
 			case sectionLog:
-				if len(m.commits) > 0 && m.selectedIdx < len(m.commits)-1 {
-					m.selectedIdx++
+				if m.advanceSelectedSkippingDimmed(1) {
 					m.clampViewport()
 					return m, m.onSelectionChanged()
 				}
 				return m, nil
 			case sectionFiles:
-				if len(m.files) > 0 && m.filesSelectedIdx < len(m.files)-1 {
+				if len(m.fileFilterVisible) > 0 && m.filesSelectedIdx < len(m.fileFilterVisible)-1 {
 					m.filesSelectedIdx++
 					m.clampFilesViewport()
 					return m, m.onFileSelectionChanged()
@@ -837,14 +847,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "k":
 			switch m.active {
 			case sectionLog:
-				if len(m.commits) > 0 && m.selectedIdx > 0 {
-					m.selectedIdx--
+				if m.advanceSelectedSkippingDimmed(-1) {
 					m.clampViewport()
 					return m, m.onSelectionChanged()
 				}
 				return m, nil
 			case sectionFiles:
-				if len(m.files) > 0 && m.filesSelectedIdx > 0 {
+				if len(m.fileFilterVisible) > 0 && m.filesSelectedIdx > 0 {
 					m.filesSelectedIdx--
 					m.clampFilesViewport()
 					return m, m.onFileSelectionChanged()
@@ -1119,7 +1128,7 @@ func (m *model) pageCommitSelection(dir int) tea.Cmd {
 // pageFileSelection moves filesSelectedIdx by ±half a files-body page.
 // Used by `d`/`u` when the files panel is focused.
 func (m *model) pageFileSelection(dir int) tea.Cmd {
-	if len(m.files) == 0 {
+	if len(m.fileFilterVisible) == 0 {
 		return nil
 	}
 	page := m.filesBodyHeight() / 2
@@ -1130,8 +1139,8 @@ func (m *model) pageFileSelection(dir int) tea.Cmd {
 	if target < 0 {
 		target = 0
 	}
-	if target > len(m.files)-1 {
-		target = len(m.files) - 1
+	if target > len(m.fileFilterVisible)-1 {
+		target = len(m.fileFilterVisible) - 1
 	}
 	if target == m.filesSelectedIdx {
 		return nil
@@ -1167,9 +1176,9 @@ func (m *model) jumpCommitBottom() tea.Cmd {
 	return m.onSelectionChanged()
 }
 
-// jumpFileTop jumps the file selection to the first file.
+// jumpFileTop jumps the file selection to the first visible file.
 func (m *model) jumpFileTop() tea.Cmd {
-	if len(m.files) == 0 || m.filesSelectedIdx == 0 {
+	if len(m.fileFilterVisible) == 0 || m.filesSelectedIdx == 0 {
 		return nil
 	}
 	m.filesSelectedIdx = 0
@@ -1177,12 +1186,12 @@ func (m *model) jumpFileTop() tea.Cmd {
 	return m.onFileSelectionChanged()
 }
 
-// jumpFileBottom jumps the file selection to the last file.
+// jumpFileBottom jumps the file selection to the last visible file.
 func (m *model) jumpFileBottom() tea.Cmd {
-	if len(m.files) == 0 {
+	if len(m.fileFilterVisible) == 0 {
 		return nil
 	}
-	target := len(m.files) - 1
+	target := len(m.fileFilterVisible) - 1
 	if target == m.filesSelectedIdx {
 		return nil
 	}
@@ -1613,76 +1622,191 @@ func summariseStderr(s string) string {
 	return ""
 }
 
-// openSearchPrompt opens the commit-list fuzzy search prompt. The
-// selection at this moment is captured so `esc` can restore it.
-func (m *model) openSearchPrompt() {
-	m.searchActive = true
-	m.searchQuery = ""
-	m.searchMatches = nil
-	m.searchMatchIdx = -1
-	m.searchOriginIdx = m.selectedIdx
-	m.searchOriginTop = m.viewportTop
+// fileFilterDebounce is the window during which a regex token that
+// becomes invalid mid-edit keeps applying its prior valid form, so
+// brief intermediate states don't cause the file pane to flicker.
+const fileFilterDebounce = 500 * time.Millisecond
+
+// fileFilterDebounceMsg is delivered by tea.Tick `fileFilterDebounce`
+// after the prompt's debounce window opened. The update path re-runs
+// the live parse so any expired prior-valid regex is dropped.
+type fileFilterDebounceMsg struct{}
+
+// openFileFilterPrompt opens the file-filter prompt. The current
+// selection (visible-list position and viewport top) is captured so
+// `esc` can restore it; the prompt is prefilled with the committed
+// expression so iterative refinement is one keystroke away.
+func (m *model) openFileFilterPrompt() {
+	m.fileFilterPromptActive = true
+	m.fileFilterPromptInput = m.fileFilterExpr.String()
+	m.fileFilterPromptExpr = m.fileFilterExpr
+	m.fileFilterPromptOrigIdx = m.filesSelectedIdx
+	m.fileFilterPromptOrigTop = m.filesViewportTop
+	m.fileFilterLastValid = nil
+	m.fileFilterInvalidSince = nil
 	m.pendingG = false
 }
 
-// recomputeSearchMatches rebuilds searchMatches against the currently
-// loaded commits using the current searchQuery.
-func (m *model) recomputeSearchMatches() {
-	if m.searchQuery == "" || len(m.commits) == 0 {
-		m.searchMatches = nil
-		return
+// reparseFileFilterPrompt re-parses the prompt input via the tolerant
+// ParsePartial path and refreshes the visible-file list so typing
+// produces live feedback. Catastrophic parse errors (unclosed quote)
+// leave the prior valid Expr in place. Invalid regex tokens are
+// debounced per position: the prior valid form keeps applying for
+// `fileFilterDebounce` (stories 17–18). Returns a tea.Cmd that
+// schedules a re-parse when the debounce window opens, so the file
+// pane re-renders even if the user stops typing.
+// deleteLastFilterToken removes the trailing comma-separated filter
+// token from input — the one a cursor at end-of-input is sitting on —
+// along with the comma and whitespace that separated it from the
+// previous token. With well-formed input it relies on ParsePartial's
+// byte spans; if the parser rejects the input (e.g. unclosed quote)
+// it falls back to trimming back through the last literal comma so
+// ctrl+w still makes progress.
+func deleteLastFilterToken(input string) string {
+	if input == "" {
+		return ""
 	}
-	items := make([]string, len(m.commits))
-	for i, c := range m.commits {
-		items[i] = c.ShortSHA + " " + c.Subject + " " + c.Author
+	_, toks, err := filefilter.ParsePartial(input)
+	if err == nil && len(toks) > 0 {
+		cut := toks[len(toks)-1].Start
+		for cut > 0 && (input[cut-1] == ' ' || input[cut-1] == '\t') {
+			cut--
+		}
+		if cut > 0 && input[cut-1] == ',' {
+			cut--
+		}
+		for cut > 0 && (input[cut-1] == ' ' || input[cut-1] == '\t') {
+			cut--
+		}
+		return input[:cut]
 	}
-	ms := searchfilter.Rank(m.searchQuery, items)
-	out := make([]int, len(ms))
-	for i, r := range ms {
-		out[i] = r.Index
+	if idx := strings.LastIndexByte(input, ','); idx >= 0 {
+		return strings.TrimRight(input[:idx], " \t")
 	}
-	m.searchMatches = out
+	return ""
 }
 
-// updateSearchPrompt handles every keypress while the search prompt is
-// open: `esc` cancels (restores prior selection), `enter` confirms
-// (moves selection to the best match), backspace edits, printable runes
-// extend the query, and any other key is absorbed so it doesn't leak to
-// the rest of the panel.
-func (m model) updateSearchPrompt(km tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) reparseFileFilterPrompt() tea.Cmd {
+	_, tokens, err := filefilter.ParsePartial(m.fileFilterPromptInput)
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	// Resize per-position cache to current token count.
+	if len(m.fileFilterLastValid) > len(tokens) {
+		m.fileFilterLastValid = m.fileFilterLastValid[:len(tokens)]
+		m.fileFilterInvalidSince = m.fileFilterInvalidSince[:len(tokens)]
+	}
+	for len(m.fileFilterLastValid) < len(tokens) {
+		m.fileFilterLastValid = append(m.fileFilterLastValid, nil)
+		m.fileFilterInvalidSince = append(m.fileFilterInvalidSince, time.Time{})
+	}
+	merged := make([]filefilter.Token, 0, len(tokens))
+	needsTick := false
+	for i, tk := range tokens {
+		if tk.Valid {
+			// Becoming valid applies immediately; remember it as the
+			// per-position fallback for future invalid edits.
+			tcopy := tk
+			m.fileFilterLastValid[i] = &tcopy
+			m.fileFilterInvalidSince[i] = time.Time{}
+			merged = append(merged, tk)
+			continue
+		}
+		// Only invalid regex tokens reach here (globs always parse).
+		prior := m.fileFilterLastValid[i]
+		if prior == nil || prior.Kind != filefilter.KindRegex {
+			// Never valid at this position, or position now means
+			// something incompatible — drop with no debounce.
+			continue
+		}
+		if m.fileFilterInvalidSince[i].IsZero() {
+			m.fileFilterInvalidSince[i] = now
+		}
+		if now.Sub(m.fileFilterInvalidSince[i]) >= fileFilterDebounce {
+			// Debounce window elapsed — drop and forget.
+			m.fileFilterLastValid[i] = nil
+			m.fileFilterInvalidSince[i] = time.Time{}
+			continue
+		}
+		merged = append(merged, *prior)
+		needsTick = true
+	}
+	m.fileFilterPromptExpr = filefilter.ExprFromTokens(m.fileFilterPromptInput, merged)
+	m.recomputeVisibleFiles(-1)
+	if needsTick {
+		return tea.Tick(fileFilterDebounce, func(time.Time) tea.Msg {
+			return fileFilterDebounceMsg{}
+		})
+	}
+	return nil
+}
+
+// updateFileFilterPrompt handles every keypress while the file-filter
+// prompt is open. Enter commits the prompt's expression as the active
+// filter; Esc discards the in-progress edit and restores the prior
+// selection; an empty submit clears the active filter.
+func (m model) updateFileFilterPrompt(km tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyStr := km.String()
 	switch keyStr {
 	case "ctrl+c":
 		return m, tea.Quit
 	case "esc":
-		m.searchActive = false
-		m.searchQuery = ""
-		m.searchMatches = nil
-		m.searchMatchIdx = -1
-		m.selectedIdx = m.searchOriginIdx
-		m.viewportTop = m.searchOriginTop
-		m.clampViewport()
+		m.fileFilterPromptActive = false
+		m.fileFilterPromptInput = ""
+		m.fileFilterPromptExpr = filefilter.Expr{}
+		m.fileFilterLastValid = nil
+		m.fileFilterInvalidSince = nil
+		m.filesSelectedIdx = m.fileFilterPromptOrigIdx
+		m.filesViewportTop = m.fileFilterPromptOrigTop
+		m.recomputeVisibleFiles(-1)
 		return m, nil
 	case "enter":
-		m.searchActive = false
-		if len(m.searchMatches) == 0 {
-			return m, nil
+		m.fileFilterPromptActive = false
+		// Promote the prompt's last-parsed Expr to the committed filter.
+		m.fileFilterExpr = m.fileFilterPromptExpr
+		m.fileFilterPromptInput = ""
+		m.fileFilterPromptExpr = filefilter.Expr{}
+		m.fileFilterLastValid = nil
+		m.fileFilterInvalidSince = nil
+		// The visible list was tracking the prompt expression; now that
+		// it equals the committed filter, just re-anchor selection.
+		m.recomputeVisibleFiles(-1)
+		// Refresh commit-row dim state from cached numstats. Submitting
+		// an empty prompt clears the filter and the dim map entirely;
+		// otherwise we re-evaluate against the new Expr.
+		m.commitFilterMatch = nil
+		m.recomputeCommitFilterMatches()
+		cmd := m.onFileSelectionChanged()
+		if pref := m.nextPrefetchCmd(); pref != nil {
+			return m, tea.Batch(cmd, pref)
 		}
-		m.searchMatchIdx = 0
-		m.selectedIdx = m.searchMatches[0]
-		m.clampViewport()
-		return m, m.onSelectionChanged()
+		return m, cmd
 	case "backspace", "ctrl+h":
-		if len(m.searchQuery) > 0 {
-			r := []rune(m.searchQuery)
-			m.searchQuery = string(r[:len(r)-1])
-			m.recomputeSearchMatches()
+		if len(m.fileFilterPromptInput) > 0 {
+			r := []rune(m.fileFilterPromptInput)
+			m.fileFilterPromptInput = string(r[:len(r)-1])
+			cmd := m.reparseFileFilterPrompt()
+			return m, cmd
 		}
 		return m, nil
+	case "ctrl+w":
+		if m.fileFilterPromptInput == "" {
+			return m, nil
+		}
+		m.fileFilterPromptInput = deleteLastFilterToken(m.fileFilterPromptInput)
+		cmd := m.reparseFileFilterPrompt()
+		return m, cmd
+	case "ctrl+k":
+		if m.fileFilterPromptInput == "" {
+			return m, nil
+		}
+		m.fileFilterPromptInput = ""
+		m.fileFilterLastValid = nil
+		m.fileFilterInvalidSince = nil
+		cmd := m.reparseFileFilterPrompt()
+		return m, cmd
 	}
-	// Treat any printable rune (including space) as input. Bubble Tea
-	// reports printable runes with msg.Type == tea.KeyRunes; everything
-	// else (arrow keys, function keys, …) is absorbed silently.
 	if km.Type == tea.KeyRunes || km.Type == tea.KeySpace {
 		var r []rune
 		if km.Type == tea.KeySpace {
@@ -1690,148 +1814,11 @@ func (m model) updateSearchPrompt(km tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			r = km.Runes
 		}
-		m.searchQuery += string(r)
-		m.recomputeSearchMatches()
+		m.fileFilterPromptInput += string(r)
+		cmd := m.reparseFileFilterPrompt()
+		return m, cmd
 	}
 	return m, nil
-}
-
-// cycleSearchMatch advances searchMatchIdx by delta (with wrap-around)
-// and updates selectedIdx to the new match.
-func (m *model) cycleSearchMatch(delta int) {
-	n := len(m.searchMatches)
-	if n == 0 {
-		return
-	}
-	if m.searchMatchIdx < 0 {
-		m.searchMatchIdx = 0
-	} else {
-		m.searchMatchIdx = ((m.searchMatchIdx+delta)%n + n) % n
-	}
-	m.selectedIdx = m.searchMatches[m.searchMatchIdx]
-	m.clampViewport()
-}
-
-// isSearchMatch reports whether commit row `idx` is in the current
-// match set. O(n) over a typically tiny match slice — fine for v1.
-func (m *model) isSearchMatch(idx int) bool {
-	for _, i := range m.searchMatches {
-		if i == idx {
-			return true
-		}
-	}
-	return false
-}
-
-// openFileSearchPrompt opens the files-list fuzzy search prompt. The
-// file selection at this moment is captured so `esc` can restore it.
-func (m *model) openFileSearchPrompt() {
-	m.fileSearchActive = true
-	m.fileSearchQuery = ""
-	m.fileSearchMatches = nil
-	m.fileSearchMatchIdx = -1
-	m.fileSearchOriginIdx = m.filesSelectedIdx
-	m.fileSearchOriginTop = m.filesViewportTop
-	m.pendingG = false
-}
-
-// recomputeFileSearchMatches rebuilds fileSearchMatches against the
-// currently-loaded files using the current fileSearchQuery. Renames
-// match against both the old and new paths so a search for the prior
-// name still finds the row.
-func (m *model) recomputeFileSearchMatches() {
-	if m.fileSearchQuery == "" || len(m.files) == 0 {
-		m.fileSearchMatches = nil
-		return
-	}
-	items := make([]string, len(m.files))
-	for i, f := range m.files {
-		if f.OldPath != "" {
-			items[i] = f.OldPath + " " + f.Path
-		} else {
-			items[i] = f.Path
-		}
-	}
-	ms := searchfilter.Rank(m.fileSearchQuery, items)
-	out := make([]int, len(ms))
-	for i, r := range ms {
-		out[i] = r.Index
-	}
-	m.fileSearchMatches = out
-}
-
-// updateFileSearchPrompt handles every keypress while the files-search
-// prompt is open. Behavior mirrors updateSearchPrompt but is scoped to
-// the file list.
-func (m model) updateFileSearchPrompt(km tea.KeyMsg) (tea.Model, tea.Cmd) {
-	keyStr := km.String()
-	switch keyStr {
-	case "ctrl+c":
-		return m, tea.Quit
-	case "esc":
-		m.fileSearchActive = false
-		m.fileSearchQuery = ""
-		m.fileSearchMatches = nil
-		m.fileSearchMatchIdx = -1
-		m.filesSelectedIdx = m.fileSearchOriginIdx
-		m.filesViewportTop = m.fileSearchOriginTop
-		m.clampFilesViewport()
-		return m, nil
-	case "enter":
-		m.fileSearchActive = false
-		if len(m.fileSearchMatches) == 0 {
-			return m, nil
-		}
-		m.fileSearchMatchIdx = 0
-		m.filesSelectedIdx = m.fileSearchMatches[0]
-		m.clampFilesViewport()
-		return m, m.onFileSelectionChanged()
-	case "backspace", "ctrl+h":
-		if len(m.fileSearchQuery) > 0 {
-			r := []rune(m.fileSearchQuery)
-			m.fileSearchQuery = string(r[:len(r)-1])
-			m.recomputeFileSearchMatches()
-		}
-		return m, nil
-	}
-	if km.Type == tea.KeyRunes || km.Type == tea.KeySpace {
-		var r []rune
-		if km.Type == tea.KeySpace {
-			r = []rune{' '}
-		} else {
-			r = km.Runes
-		}
-		m.fileSearchQuery += string(r)
-		m.recomputeFileSearchMatches()
-	}
-	return m, nil
-}
-
-// cycleFileSearchMatch advances fileSearchMatchIdx by delta (with
-// wrap-around) and updates filesSelectedIdx to the new match.
-func (m *model) cycleFileSearchMatch(delta int) {
-	n := len(m.fileSearchMatches)
-	if n == 0 {
-		return
-	}
-	if m.fileSearchMatchIdx < 0 {
-		m.fileSearchMatchIdx = 0
-	} else {
-		m.fileSearchMatchIdx = ((m.fileSearchMatchIdx+delta)%n + n) % n
-	}
-	m.filesSelectedIdx = m.fileSearchMatches[m.fileSearchMatchIdx]
-	m.clampFilesViewport()
-}
-
-// isFileSearchMatch reports whether file row `idx` is in the current
-// match set.
-func (m *model) isFileSearchMatch(idx int) bool {
-	for _, i := range m.fileSearchMatches {
-		if i == idx {
-			return true
-		}
-	}
-	return false
 }
 
 // updateHelpModal handles keys while the help overlay is open: `?`,
@@ -1961,19 +1948,16 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.pendingRefreshSHA = ""
 	m.pendingRefreshPath = ""
 
-	m.searchActive = false
-	m.searchQuery = ""
-	m.searchMatches = nil
-	m.searchMatchIdx = -1
-	m.searchOriginIdx = 0
-	m.searchOriginTop = 0
-
-	m.fileSearchActive = false
-	m.fileSearchQuery = ""
-	m.fileSearchMatches = nil
-	m.fileSearchMatchIdx = -1
-	m.fileSearchOriginIdx = 0
-	m.fileSearchOriginTop = 0
+	m.fileFilterPromptActive = false
+	m.fileFilterPromptInput = ""
+	m.fileFilterPromptExpr = filefilter.Expr{}
+	m.fileFilterPromptOrigIdx = 0
+	m.fileFilterPromptOrigTop = 0
+	m.fileFilterExpr = filefilter.Expr{}
+	m.fileFilterVisible = nil
+	m.fileFilterLastValid = nil
+	m.fileFilterInvalidSince = nil
+	m.commitFilterMatch = nil
 
 	m.middleTab = tabFiles
 
@@ -2018,8 +2002,8 @@ func (m model) refresh() (tea.Model, tea.Cmd) {
 	} else {
 		m.pendingRefreshSHA = ""
 	}
-	if m.filesSelectedIdx >= 0 && m.filesSelectedIdx < len(m.files) {
-		m.pendingRefreshPath = m.files[m.filesSelectedIdx].Path
+	if origIdx := m.selectedFileOrigIdx(); origIdx >= 0 {
+		m.pendingRefreshPath = m.files[origIdx].Path
 	} else {
 		m.pendingRefreshPath = ""
 	}
@@ -2041,6 +2025,7 @@ func (m model) refresh() (tea.Model, tea.Cmd) {
 	m.filesSHA = ""
 	m.filesSelectedIdx = 0
 	m.filesViewportTop = 0
+	m.fileFilterVisible = nil
 
 	m.diff = diffrender.Result{}
 	m.diffSHA = ""
@@ -2055,19 +2040,18 @@ func (m model) refresh() (tea.Model, tea.Cmd) {
 	m.diffLoading = false
 	m.resetBinarySize()
 
-	m.searchActive = false
-	m.searchQuery = ""
-	m.searchMatches = nil
-	m.searchMatchIdx = -1
-	m.searchOriginIdx = 0
-	m.searchOriginTop = 0
-
-	m.fileSearchActive = false
-	m.fileSearchQuery = ""
-	m.fileSearchMatches = nil
-	m.fileSearchMatchIdx = -1
-	m.fileSearchOriginIdx = 0
-	m.fileSearchOriginTop = 0
+	// File filter persists across ctrl+r refresh (PRD §10/11) so a
+	// reviewer's investigation context survives the reload. The prompt
+	// itself must be closed — its origin snapshots no longer apply.
+	m.fileFilterPromptActive = false
+	m.fileFilterPromptInput = ""
+	m.fileFilterPromptExpr = filefilter.Expr{}
+	m.fileFilterPromptOrigIdx = 0
+	m.fileFilterPromptOrigTop = 0
+	// Refresh rebuilds the loader, invalidating its numstat cache, so
+	// every cached dim evaluation is stale. The map is rebuilt on
+	// demand as NumStatResults arrive for the new loader.
+	m.commitFilterMatch = nil
 
 	m.clearError()
 	statusCmd := m.raiseStatus("Refreshed")
@@ -2129,7 +2113,7 @@ func (m *model) startDiffForSelection() tea.Cmd {
 		m.diffLoading = false
 		return nil
 	}
-	if m.filesSelectedIdx < len(m.files) && m.files[m.filesSelectedIdx].IsBinary {
+	if origIdx := m.selectedFileOrigIdx(); origIdx >= 0 && m.files[origIdx].IsBinary {
 		// Binary files don't trigger a text-diff fetch; clear any prior
 		// diff content so the binary-delta placeholder renders cleanly.
 		m.ldr.CancelDiff()
@@ -2173,7 +2157,11 @@ func (m *model) maybeStartBinarySize() tea.Cmd {
 	if !ok {
 		return nil
 	}
-	f := m.files[m.filesSelectedIdx]
+	origIdx := m.selectedFileOrigIdx()
+	if origIdx < 0 {
+		return nil
+	}
+	f := m.files[origIdx]
 	if !f.IsBinary {
 		return nil
 	}
@@ -2215,16 +2203,18 @@ func (m *model) startSpinnerCmd() tea.Cmd {
 }
 
 // currentSelection returns the (sha, path) of the currently-selected
-// commit + file, plus ok=true. ok is false when either selection is
-// missing.
+// commit + visible file, plus ok=true. ok is false when either
+// selection is missing (including the case where the file filter has
+// hidden every file in the current commit).
 func (m *model) currentSelection() (sha, path string, ok bool) {
-	if len(m.commits) == 0 || len(m.files) == 0 {
+	if len(m.commits) == 0 || len(m.fileFilterVisible) == 0 {
 		return "", "", false
 	}
-	if m.filesSelectedIdx >= len(m.files) {
+	if m.filesSelectedIdx >= len(m.fileFilterVisible) {
 		return "", "", false
 	}
-	return m.commits[m.selectedIdx].SHA, m.files[m.filesSelectedIdx].Path, true
+	origIdx := m.fileFilterVisible[m.filesSelectedIdx]
+	return m.commits[m.selectedIdx].SHA, m.files[origIdx].Path, true
 }
 
 // handleMouse routes a MouseMsg. v1 acts on two kinds of mouse input:
@@ -2234,14 +2224,14 @@ func (m *model) currentSelection() (sha, path string, ok bool) {
 // that row and activates the corresponding section, firing the same
 // downstream live-update chain as a keyboard move. Clicks on right
 // panels are inert. Mouse events are suppressed entirely when the
-// terminal is too small or any modal / search prompt is open so they
+// terminal is too small or any modal / prompt is open so they
 // can't bypass those gates.
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	lo := layout.Compute(m.w, m.h)
 	if lo.TooSmall {
 		return m, nil
 	}
-	if m.helpModalOpen || m.wtModalOpen || m.searchActive || m.fileSearchActive {
+	if m.helpModalOpen || m.wtModalOpen || m.fileFilterPromptActive {
 		return m, nil
 	}
 	if m.rebaseState != rebaseStateIdle {
@@ -2293,7 +2283,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			idx := m.filesViewportTop + row
-			if idx < 0 || idx >= len(m.files) {
+			if idx < 0 || idx >= len(m.fileFilterVisible) {
 				return m, nil
 			}
 			selectionChanged := idx != m.filesSelectedIdx
@@ -2550,12 +2540,26 @@ func (m *model) logBodyHeight() int {
 	return lo.Log.H - 1 // minus title row
 }
 
-// clampFilesViewport adjusts filesViewportTop so filesSelectedIdx stays visible.
+// clampFilesViewport adjusts filesViewportTop so filesSelectedIdx stays
+// visible. `filesSelectedIdx` and `filesViewportTop` are positions
+// inside the visible (filtered) file list, not the raw files slice.
 func (m *model) clampFilesViewport() {
 	bodyH := m.filesBodyHeight()
 	if bodyH <= 0 {
 		m.filesViewportTop = 0
 		return
+	}
+	visN := len(m.fileFilterVisible)
+	if visN == 0 {
+		m.filesSelectedIdx = 0
+		m.filesViewportTop = 0
+		return
+	}
+	if m.filesSelectedIdx >= visN {
+		m.filesSelectedIdx = visN - 1
+	}
+	if m.filesSelectedIdx < 0 {
+		m.filesSelectedIdx = 0
 	}
 	if m.filesSelectedIdx < m.filesViewportTop {
 		m.filesViewportTop = m.filesSelectedIdx
@@ -2566,13 +2570,170 @@ func (m *model) clampFilesViewport() {
 	if m.filesViewportTop < 0 {
 		m.filesViewportTop = 0
 	}
-	maxTop := len(m.files) - bodyH
+	maxTop := visN - bodyH
 	if maxTop < 0 {
 		maxTop = 0
 	}
 	if m.filesViewportTop > maxTop {
 		m.filesViewportTop = maxTop
 	}
+}
+
+// recomputeVisibleFiles rebuilds m.fileFilterVisible from m.files and
+// the currently active filter expression. If preservedOrigIdx >= 0,
+// the selection is moved to that original-file index when it remains
+// visible, otherwise it clamps to the nearest visible original index
+// (the first visible idx ≥ preservedOrigIdx, or the last visible idx).
+// When preservedOrigIdx is -1 the selection's prior original index is
+// inferred from the current filesSelectedIdx before the rebuild.
+func (m *model) recomputeVisibleFiles(preservedOrigIdx int) {
+	if preservedOrigIdx < 0 {
+		preservedOrigIdx = m.selectedFileOrigIdx()
+	}
+	expr := m.activeFileFilterExpr()
+	m.fileFilterVisible = m.fileFilterVisible[:0]
+	if cap(m.fileFilterVisible) < len(m.files) {
+		m.fileFilterVisible = make([]int, 0, len(m.files))
+	}
+	for i, f := range m.files {
+		if expr.Match(f.Path, f.OldPath) {
+			m.fileFilterVisible = append(m.fileFilterVisible, i)
+		}
+	}
+	// Re-anchor selection by original index.
+	newSel := -1
+	if preservedOrigIdx >= 0 {
+		for visIdx, origIdx := range m.fileFilterVisible {
+			if origIdx == preservedOrigIdx {
+				newSel = visIdx
+				break
+			}
+		}
+		if newSel < 0 {
+			// Nearest visible: first visible idx >= preservedOrigIdx.
+			for visIdx, origIdx := range m.fileFilterVisible {
+				if origIdx >= preservedOrigIdx {
+					newSel = visIdx
+					break
+				}
+			}
+			if newSel < 0 && len(m.fileFilterVisible) > 0 {
+				newSel = len(m.fileFilterVisible) - 1
+			}
+		}
+	}
+	if newSel < 0 {
+		newSel = 0
+	}
+	m.filesSelectedIdx = newSel
+	m.clampFilesViewport()
+}
+
+// activeFileFilterExpr returns the Expr that should drive the visible
+// file set right now: the live prompt preview while the prompt is open,
+// otherwise the committed filter.
+func (m *model) activeFileFilterExpr() filefilter.Expr {
+	if m.fileFilterPromptActive {
+		return m.fileFilterPromptExpr
+	}
+	return m.fileFilterExpr
+}
+
+// commitMatchesFileFilter reports whether at least one file in files
+// matches expr. Used to compute the dim state of a commit row.
+func commitMatchesFileFilter(files []gitcmd.FileStat, expr filefilter.Expr) bool {
+	for _, f := range files {
+		if expr.Match(f.Path, f.OldPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// recomputeCommitFilterMatches rebuilds m.commitFilterMatch from the
+// loader's cached numstats: every loaded commit whose numstat is cached
+// gets evaluated against the current filter and stored. Commits with no
+// cached numstat are left absent (they dim later as their NumStatResult
+// arrives, per PRD story 27). A no-op when the filter is empty —
+// callers should reset the map themselves in that case.
+func (m *model) recomputeCommitFilterMatches() {
+	if m.fileFilterExpr.IsEmpty() || m.ldr == nil {
+		return
+	}
+	if m.commitFilterMatch == nil {
+		m.commitFilterMatch = make(map[string]bool, len(m.commits))
+	}
+	expr := m.fileFilterExpr
+	for _, c := range m.commits {
+		if fs, ok := m.ldr.NumStatCached(c.SHA); ok {
+			m.commitFilterMatch[c.SHA] = commitMatchesFileFilter(fs, expr)
+		}
+	}
+}
+
+// isCommitDimmed reports whether the row for sha should be rendered
+// dim in the commit log: a file filter is active and we've evaluated
+// the commit's numstat and found no matching files. Unknown (numstat
+// not yet loaded) is intentionally treated as "not dim" so commits
+// progressively dim as data arrives rather than starting dim and
+// brightening (which would be visually noisier).
+func (m *model) isCommitDimmed(sha string) bool {
+	if m.fileFilterExpr.IsEmpty() {
+		return false
+	}
+	matches, ok := m.commitFilterMatch[sha]
+	if !ok {
+		return false
+	}
+	return !matches
+}
+
+// advanceSelectedSkippingDimmed moves m.selectedIdx by dir (+1 or -1),
+// skipping over consecutive dimmed commits in the same direction. A
+// commit is dimmed when its numstat has been evaluated and contains no
+// files matching the active filter; unknown commits (numstat not yet
+// loaded) are not skipped, so navigation never blocks on background
+// prefetch. Returns true if selection moved.
+func (m *model) advanceSelectedSkippingDimmed(dir int) bool {
+	if len(m.commits) == 0 || (dir != 1 && dir != -1) {
+		return false
+	}
+	i := m.selectedIdx + dir
+	for i >= 0 && i < len(m.commits) && m.isCommitDimmed(m.commits[i].SHA) {
+		i += dir
+	}
+	if i < 0 || i >= len(m.commits) || i == m.selectedIdx {
+		return false
+	}
+	m.selectedIdx = i
+	return true
+}
+
+// nextPrefetchCmd returns a tea.Cmd that loads the numstat for the
+// first commit in m.commits whose numstat is not already cached, so
+// commitFilterMatch can be populated for it and the row dimmed (or
+// kept un-dimmed). Returns nil when every loaded commit's numstat is
+// already cached, or when no file filter is active.
+func (m *model) nextPrefetchCmd() tea.Cmd {
+	if m.fileFilterExpr.IsEmpty() || m.ldr == nil {
+		return nil
+	}
+	for _, c := range m.commits {
+		if _, ok := m.ldr.NumStatCached(c.SHA); ok {
+			continue
+		}
+		return m.ldr.LoadNumStatPrefetch(c.SHA)
+	}
+	return nil
+}
+
+// selectedFileOrigIdx returns the original m.files index that
+// filesSelectedIdx currently points to, or -1 if there is no selection.
+func (m *model) selectedFileOrigIdx() int {
+	if m.filesSelectedIdx < 0 || m.filesSelectedIdx >= len(m.fileFilterVisible) {
+		return -1
+	}
+	return m.fileFilterVisible[m.filesSelectedIdx]
 }
 
 func (m *model) filesBodyHeight() int {
@@ -2600,7 +2761,7 @@ var (
 	inactiveSelectedRowStyle = lipgloss.NewStyle().
 					Background(lipgloss.Color("236")).
 					Foreground(lipgloss.Color("250"))
-	shortSHAStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	shortSHAStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
 	relDateStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	authorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
 
@@ -2609,6 +2770,13 @@ var (
 	// over the subject text on the same rows.
 	droppedActionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
 	droppedSubjectStyle = lipgloss.NewStyle().Strikethrough(true).Faint(true)
+
+	// commitDimStyle renders a non-selected commit row
+	// in a uniformly dim color when the active file filter excludes all
+	// of that commit's files. Applied over the plain (color-stripped)
+	// row so the dim is uniform rather than mixing with the per-column
+	// foreground palette.
+	commitDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Strikethrough(true)
 
 	// Ref-decoration colors on commit rows. HEAD is the brightest
 	// (cyan + bold), local branches are green, remote-tracking
@@ -2621,20 +2789,29 @@ var (
 	errMsgStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	statusMsgStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 
-	spinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	spinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
 	staleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
-	// searchMatchRowStyle highlights commit rows that match the active
-	// or just-confirmed search query (but are not the currently-selected
-	// row). The focused match still gets the standard selection style.
-	searchMatchRowStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("58")).
-				Foreground(lipgloss.Color("230"))
-	searchPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	searchPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+
+	// Token styles for the persistent filter row. These paint
+	// individual spans of the filter expression so the user can see
+	// at a glance which terms are special grammar, which are valid /
+	// invalid regex, and which are actually selecting files.
+	filterSpecialStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
+	filterRegexValidStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("135"))
+	filterRegexInvalidStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	filterBaseMatchStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8f9d6a"))
+	filterBaseNoMatchStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	filterLabelStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	// logUnderlineStyle paints a full-width rule under the log panel by
+	// underlining the spaces in the row immediately below it.
+	logUnderlineStyle = lipgloss.NewStyle().Underline(true).Foreground(lipgloss.Color("240"))
 
 	fileStatusStyles = map[string]lipgloss.Style{
 		"A": lipgloss.NewStyle().Foreground(lipgloss.Color("114")), // green
-		"M": lipgloss.NewStyle().Foreground(lipgloss.Color("214")), // yellow
+		"M": lipgloss.NewStyle().Foreground(lipgloss.Color("179")), // orange
 		"D": lipgloss.NewStyle().Foreground(lipgloss.Color("203")), // red
 		"R": lipgloss.NewStyle().Foreground(lipgloss.Color("75")),  // blue
 		"C": lipgloss.NewStyle().Foreground(lipgloss.Color("141")), // magenta
@@ -3012,9 +3189,9 @@ func renderLogBody(m model, w, bodyH int, active bool) string {
 			} else {
 				rendered = inactiveSelectedRowStyle.Render(plain)
 			}
-		case m.isSearchMatch(idx):
+		case m.isCommitDimmed(m.commits[idx].SHA):
 			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, marked)
-			rendered = searchMatchRowStyle.Render(plain)
+			rendered = commitDimStyle.Render(plain)
 		default:
 			rendered = renderLogRow(m.commits[idx], w, hasPendingColumn, marked)
 		}
@@ -3061,7 +3238,7 @@ func messageLineCount(d gitcmd.CommitDetail) int { return len(messageLines(d)) }
 
 var (
 	msgLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	msgSHAStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	msgSHAStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
 )
 
 // styleMessageLine applies dim coloring to the Tags: label, accent
@@ -3268,12 +3445,14 @@ func renderMetadataPanel(m model, w, h int) string {
 
 // renderFilesPanel renders the bottom-left files panel for the
 // currently-loaded numstat. When stale is true the rows are rendered
-// in a single dim color.
+// in a single dim color. While a file filter is active the title row
+// is suffixed (right-justified) with the expression and a visible/total
+// count.
 func renderFilesPanel(m model, w, h int, active, stale bool) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	title := renderTitleWithSpinner("files", w, active, stale, m.spinnerFrame)
+	title := renderFilesTitle(m, w, active, stale)
 	bodyH := h - 1
 	if bodyH <= 0 {
 		return title
@@ -3281,11 +3460,18 @@ func renderFilesPanel(m model, w, h int, active, stale bool) string {
 	return title + "\n" + renderFilesBodyWithScrollbar(m, w, bodyH, active, stale)
 }
 
+// renderFilesTitle renders the files-pane title row. The filter
+// expression and match counter live in the bottom status panel
+// (see renderFilterPanel), not the files header.
+func renderFilesTitle(m model, w int, active, stale bool) string {
+	return renderTitleWithSpinner("files", w, active, stale, m.spinnerFrame)
+}
+
 // renderFilesBodyWithScrollbar renders the files panel body and overlays
-// a vertical scrollbar column on the right when len(m.files) overflows
-// the viewport.
+// a vertical scrollbar column on the right when the visible file list
+// overflows the viewport.
 func renderFilesBodyWithScrollbar(m model, w, bodyH int, active, stale bool) string {
-	start, length, draw := layout.ScrollbarThumb(len(m.files), bodyH, m.filesViewportTop, bodyH)
+	start, length, draw := layout.ScrollbarThumb(len(m.fileFilterVisible), bodyH, m.filesViewportTop, bodyH)
 	if !draw || w < 2 {
 		return renderFilesBody(m, w, bodyH, active, stale)
 	}
@@ -3295,12 +3481,18 @@ func renderFilesBodyWithScrollbar(m model, w, bodyH int, active, stale bool) str
 // renderFilesBody renders the files panel's body rows (no title) at
 // the given width and body height. Used directly by the small-mode
 // tab strip path, where the tab strip replaces the per-panel title.
+//
+// When a filter is active and no files match, the body renders as
+// blank rows (PRD: "file pane is blank when no files in the current
+// commit match the filter"). The "loading…" / "No changes" / clean-merge
+// placeholders apply only when there is no filter active.
 func renderFilesBody(m model, w, bodyH int, active, stale bool) string {
 	if w <= 0 || bodyH <= 0 {
 		return ""
 	}
 	lines := make([]string, 0, bodyH)
-	if len(m.files) == 0 {
+	filterActive := !m.activeFileFilterExpr().IsEmpty()
+	if len(m.files) == 0 && !filterActive {
 		var placeholder string
 		if m.filesSHA == "" {
 			placeholder = "loading…"
@@ -3315,7 +3507,11 @@ func renderFilesBody(m model, w, bodyH int, active, stale bool) string {
 		}
 		return strings.Join(lines, "\n")
 	}
-	rows := filelist.Format(toFilelist(m.files), w)
+	visible := make([]gitcmd.FileStat, 0, len(m.fileFilterVisible))
+	for _, origIdx := range m.fileFilterVisible {
+		visible = append(visible, m.files[origIdx])
+	}
+	rows := filelist.Format(toFilelist(visible), w)
 	for row := 0; row < bodyH; row++ {
 		idx := m.filesViewportTop + row
 		if idx >= len(rows) {
@@ -3332,9 +3528,6 @@ func renderFilesBody(m model, w, bodyH int, active, stale bool) string {
 			} else {
 				rendered = inactiveSelectedRowStyle.Render(plain)
 			}
-		} else if m.isFileSearchMatch(idx) {
-			plain := padOrTruncate(fileRowPlain(rows[idx]), w)
-			rendered = searchMatchRowStyle.Render(plain)
 		} else {
 			rendered = padOrTruncate(fileRowStyled(rows[idx]), w)
 		}
@@ -3463,7 +3656,7 @@ func diffPlaceholder(m model) (string, bool) {
 	if len(m.files) == 0 {
 		return "", true
 	}
-	if m.filesSelectedIdx < len(m.files) && m.files[m.filesSelectedIdx].IsBinary {
+	if origIdx := m.selectedFileOrigIdx(); origIdx >= 0 && m.files[origIdx].IsBinary {
 		sha, path, ok := m.currentSelection()
 		if !ok || m.binSizeSHA != sha || m.binSizePath != path {
 			return "Binary file (loading size…)", true
@@ -3560,9 +3753,26 @@ func (m model) View() string {
 		hGap := strings.Repeat(" \n", lo.Message.H-1) + " "
 		middleRow = lipgloss.JoinHorizontal(lipgloss.Top, leftCol, hGap, rightCol)
 	}
-	diffPanel := renderDiffPanel(m, lo.Diff.W, lo.Diff.H, diffActive, m.diffLoading)
+	showStatus := m.fileFilterPromptActive || !m.fileFilterExpr.IsEmpty() || m.errMsg != "" || m.statusMsg != ""
+	diffH := lo.Diff.H
+	if !showStatus {
+		diffH += lo.Status.H
+	}
+	// Reserve one blank row at the bottom of the diff so the diff body
+	// never butts up against the filter panel (when shown) or the
+	// terminal edge (when hidden).
+	diffPanel := renderDiffPanel(m, lo.Diff.W, diffH-1, diffActive, m.diffLoading)
+	diffTrailingGap := strings.Repeat(" ", m.w)
+	// A full-width underline under the log panel: replace the spaces in
+	// the log/middle gap row with underline-styled spaces so the log's
+	// bottom edge gets a visible rule.
+	logUnderlineGap := logUnderlineStyle.Render(strings.Repeat(" ", m.w))
 	vGap := strings.Repeat(" ", m.w)
-	base := strings.Join([]string{logPanel, vGap, middleRow, vGap, diffPanel, m.renderStatus(lo.Status.W)}, "\n")
+	parts := []string{logPanel, logUnderlineGap, middleRow, vGap, diffPanel, diffTrailingGap}
+	if showStatus {
+		parts = append(parts, m.renderStatus(lo.Status.W))
+	}
+	base := strings.Join(parts, "\n")
 
 	if m.helpModalOpen {
 		return overlayCentered(base, renderHelpModal(), m.w, m.h)
@@ -3715,15 +3925,17 @@ func renderHelpModal() string {
 		}},
 		{title: "Commits (top)", bindings: []binding{
 			{"ctrl+j / ctrl+k", "move selection"},
-			{"/", "fuzzy search sha / subject / author"},
-			{"n / N", "next / previous search match"},
 			{"ctrl+d", "mark/unmark commit for drop"},
 			{"ctrl+s", "save pending actions"},
 		}},
 		{title: "Files (bottom)", bindings: []binding{
 			{"ctrl+j / ctrl+k", "scroll diff down / up one line"},
-			{"/", "fuzzy search file paths"},
-			{"n / N", "next / previous search match"},
+			{"n / N", "next / previous hunk in diff"},
+		}},
+		{title: "Filter (any pane)", bindings: []binding{
+			{"/", "filter files (glob, /regex/, comma-OR, !negate); dims non-matching commits"},
+			{"ctrl+w", "while editing: delete the token under the cursor"},
+			{"ctrl+k", "while editing: clear all filter tokens"},
 		}},
 		{title: "Message / diff (right panels)", bindings: []binding{
 			{"j / k", "line scroll"},
@@ -3900,29 +4112,11 @@ func (m model) renderStatus(width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if m.searchActive {
-		var hint string
-		switch {
-		case m.searchQuery == "":
-			hint = " (type to search; enter confirms, esc cancels)"
-		case len(m.searchMatches) == 0:
-			hint = " (no matches)"
-		default:
-			hint = fmt.Sprintf(" (%d match%s)", len(m.searchMatches), plural(len(m.searchMatches)))
-		}
-		return searchPromptStyle.Render(padOrTruncate("/"+m.searchQuery+"█"+hint, width))
+	if m.fileFilterPromptActive {
+		return m.renderFilterPanel(width, true)
 	}
-	if m.fileSearchActive {
-		var hint string
-		switch {
-		case m.fileSearchQuery == "":
-			hint = " (type to search files; enter confirms, esc cancels)"
-		case len(m.fileSearchMatches) == 0:
-			hint = " (no matches)"
-		default:
-			hint = fmt.Sprintf(" (%d match%s)", len(m.fileSearchMatches), plural(len(m.fileSearchMatches)))
-		}
-		return searchPromptStyle.Render(padOrTruncate("/"+m.fileSearchQuery+"█"+hint, width))
+	if !m.fileFilterExpr.IsEmpty() {
+		return m.renderFilterPanel(width, false)
 	}
 	if m.errMsg != "" {
 		ts := m.errMsgTime
@@ -3941,6 +4135,187 @@ func (m model) renderStatus(width int) string {
 		return statusMsgStyle.Render(padOrTruncate(body, width))
 	}
 	return strings.Repeat(" ", width)
+}
+
+// renderFilterPanel renders the single-line filter row that lives in the
+// status slot. When `active`, it shows the live prompt input with a
+// cursor block at the end; otherwise it shows the committed expression.
+// In both cases a right-justified (visible/total) match indicator is
+// appended.
+func (m model) renderFilterPanel(width int, active bool) string {
+	var input string
+	if active {
+		input = m.fileFilterPromptInput
+	} else {
+		input = m.fileFilterExpr.String()
+	}
+	label := filterLabelStyle.Render("filter: ")
+	body := m.renderStyledFilterInput(input)
+	if active {
+		body += "█"
+	}
+	left := label + body
+	var right string
+	if active && input == "" {
+		right = filterLabelStyle.Render("(type a glob; enter commits, esc cancels)")
+	} else if len(m.files) == 0 {
+		right = ""
+	} else if len(m.fileFilterVisible) == 0 {
+		right = filterLabelStyle.Render("(no matches)")
+	} else {
+		right = filterLabelStyle.Render(fmt.Sprintf("(%d/%d)", len(m.fileFilterVisible), len(m.files)))
+	}
+	leftW := lipgloss.Width(left)
+	rightW := lipgloss.Width(right)
+	if leftW+rightW+1 > width {
+		// Not enough room for both — drop the right side.
+		return withOverline(padOrTruncate(left, width))
+	}
+	gap := width - leftW - rightW
+	if gap < 1 {
+		gap = 1
+	}
+	return withOverline(left + strings.Repeat(" ", gap) + right)
+}
+
+// withOverline wraps s in SGR 53 (overline on) / 55 (overline off) so
+// the rendered row carries a full-width line along its top edge. The
+// rule itself is pinned to white via SGR 58 (underline/overline color)
+// so it doesn't pick up the foreground of the styled text underneath.
+// Any embedded full resets (`\x1b[0m` / `\x1b[m`) inside s would
+// otherwise drop the overline and its color mid-row, so re-emit both
+// after each.
+const overlineOn = "\x1b[53m\x1b[58;5;15m"
+
+func withOverline(s string) string {
+	s = strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+overlineOn)
+	s = strings.ReplaceAll(s, "\x1b[m", "\x1b[m"+overlineOn)
+	return overlineOn + s + "\x1b[59m\x1b[55m"
+}
+
+// renderStyledFilterInput renders `input` with per-token coloring:
+//   - whole input red if it fails to tokenize
+//   - leading `!`, `*`/`**` (outside quotes), and regex `/` delimiters → blue
+//   - regex body → purple (valid) or red (invalid)
+//   - glob body → green when at least one file matches the token, orange otherwise
+func (m model) renderStyledFilterInput(input string) string {
+	if input == "" {
+		return ""
+	}
+	_, tokens, err := filefilter.ParsePartial(input)
+	if err != nil {
+		return filterRegexInvalidStyle.Render(input)
+	}
+	var b strings.Builder
+	pos := 0
+	for _, tk := range tokens {
+		if tk.Start < pos || tk.End > len(input) || tk.End <= tk.Start {
+			continue
+		}
+		if tk.Start > pos {
+			b.WriteString(filterLabelStyle.Render(input[pos:tk.Start]))
+		}
+		anyMatch := false
+		for _, f := range m.files {
+			if tk.Matches(f.Path, f.OldPath) {
+				anyMatch = true
+				break
+			}
+		}
+		b.WriteString(renderFilterToken(input[tk.Start:tk.End], tk, anyMatch))
+		pos = tk.End
+	}
+	if pos < len(input) {
+		b.WriteString(filterLabelStyle.Render(input[pos:]))
+	}
+	return b.String()
+}
+
+// renderFilterToken styles one token's raw source bytes.
+func renderFilterToken(src string, tk filefilter.Token, anyMatch bool) string {
+	if src == "" {
+		return ""
+	}
+	var b strings.Builder
+	i := 0
+	if tk.Negate && i < len(src) && src[i] == '!' {
+		b.WriteString(filterSpecialStyle.Render("!"))
+		i++
+	}
+	rest := src[i:]
+	if tk.Kind == filefilter.KindRegex {
+		regexStyle := filterRegexValidStyle
+		if !tk.Valid {
+			regexStyle = filterRegexInvalidStyle
+		}
+		// rest is `/body/` or `/body` (unclosed — falls back to glob, but
+		// kind is regex only when there's a close). Paint the leading and
+		// trailing `/` as special, body in regex style.
+		if len(rest) > 0 && rest[0] == '/' {
+			b.WriteString(filterSpecialStyle.Render("/"))
+			rest = rest[1:]
+		}
+		hasClose := len(rest) > 0 && rest[len(rest)-1] == '/'
+		body := rest
+		if hasClose {
+			body = rest[:len(rest)-1]
+		}
+		if body != "" {
+			b.WriteString(regexStyle.Render(body))
+		}
+		if hasClose {
+			b.WriteString(filterSpecialStyle.Render("/"))
+		}
+		return b.String()
+	}
+	// Glob: walk runes, paint `*`/`**` runs outside quotes as special;
+	// everything else gets the orange/green base style.
+	baseStyle := filterBaseNoMatchStyle
+	if anyMatch {
+		baseStyle = filterBaseMatchStyle
+	}
+	inQuote := false
+	runs := []byte(rest)
+	flush := func(s string, special bool) {
+		if s == "" {
+			return
+		}
+		if special {
+			b.WriteString(filterSpecialStyle.Render(s))
+		} else {
+			b.WriteString(baseStyle.Render(s))
+		}
+	}
+	start := 0
+	mode := 0 // 0 = base, 1 = special-star
+	for k := 0; k < len(runs); k++ {
+		c := runs[k]
+		if c == '"' {
+			// Flush current run including the quote as base.
+			if mode == 1 {
+				flush(string(runs[start:k]), true)
+				start = k
+				mode = 0
+			}
+			inQuote = !inQuote
+			continue
+		}
+		if c == '*' && !inQuote {
+			if mode == 0 {
+				flush(string(runs[start:k]), false)
+				start = k
+				mode = 1
+			}
+			continue
+		}
+		if mode == 1 {
+			flush(string(runs[start:k]), true)
+			start = k
+			mode = 0
+		}
+	}
+	flush(string(runs[start:]), mode == 1)
+	return b.String()
 }
 
 func plural(n int) string {

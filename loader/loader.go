@@ -90,6 +90,10 @@ type NumStatResult struct {
 	Files  []gitcmd.FileStat
 	Err    error
 	Cached bool
+	// Prefetch is true when the result came from LoadNumStatPrefetch,
+	// so the model can distinguish background dim-state population from
+	// selection-driven loads.
+	Prefetch bool
 }
 
 // DiffResult is the message produced by LoadDiff. Raw is the full-file
@@ -194,6 +198,27 @@ func (l *Loader) LoadNumStat(sha string) tea.Cmd {
 	}
 }
 
+// LoadNumStatPrefetch returns a tea.Cmd that delivers a NumStatResult
+// for sha without participating in the cancel/debounce protocol used by
+// LoadNumStat. Intended for background dim-state population: it never
+// cancels in-flight selection-driven loads and never gets cancelled by
+// them. The emitted NumStatResult has Prefetch=true.
+func (l *Loader) LoadNumStatPrefetch(sha string) tea.Cmd {
+	if fs, ok := l.numstat.get(sha); ok {
+		return func() tea.Msg {
+			return NumStatResult{SHA: sha, Files: fs, Cached: true, Prefetch: true}
+		}
+	}
+	return func() tea.Msg {
+		ctx := context.Background()
+		fs, err := l.src.NumStat(ctx, sha)
+		if err == nil {
+			l.numstat.add(sha, fs)
+		}
+		return NumStatResult{SHA: sha, Files: fs, Err: err, Prefetch: true}
+	}
+}
+
 // LoadDiff returns a tea.Cmd that delivers a DiffResult for (sha,
 // path). Cache, debounce, and cancellation semantics match LoadDetail.
 func (l *Loader) LoadDiff(sha, path string) tea.Cmd {
@@ -242,6 +267,15 @@ func (l *Loader) LoadDiff(sha, path string) tea.Cmd {
 func (l *Loader) CancelDetail()  { l.swapDetailCtx() }
 func (l *Loader) CancelNumStat() { l.swapNumStatCtx() }
 func (l *Loader) CancelDiff()    { l.swapDiffCtx() }
+
+// NumStatCached returns the cached numstat for sha if present, without
+// triggering a fetch or affecting LRU ordering's effect on in-flight
+// loads. Callers that want to evaluate commits in bulk (e.g. the file
+// filter's commit-dim pass) use this to read whatever's already cached
+// without disturbing the single-slot in-flight numstat fetch.
+func (l *Loader) NumStatCached(sha string) ([]gitcmd.FileStat, bool) {
+	return l.numstat.get(sha)
+}
 
 func (l *Loader) swapDetailCtx() context.Context {
 	l.mu.Lock()

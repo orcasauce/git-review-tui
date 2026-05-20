@@ -445,8 +445,8 @@ func (r Result) HunkRange(activeHunk int) (first, last int, ok bool) {
 // FormatLineActive renders Lines[idx] like FormatLine and additionally
 // wraps the result with an SGR overline when idx is the first line of
 // activeHunk and/or an SGR underline when it is the last. The boundary
-// color (SGR 58) reflects the line's Kind: add→256-color 83, del→
-// 256-color 203, context→default (no SGR 58 emitted). activeHunk < 0
+// color (SGR 58) reflects the line's Kind: add→addGutterBg, del→
+// delGutterBg, context→default (no SGR 58 emitted). activeHunk < 0
 // disables the decoration.
 func (r Result) FormatLineActive(idx, width, hScroll, activeHunk int) string {
 	s := r.FormatLine(idx, width, hScroll)
@@ -468,9 +468,9 @@ func (r Result) FormatLineActive(idx, width, hScroll, activeHunk int) string {
 	}
 	switch r.Lines[idx].Kind {
 	case Add:
-		active.WriteString("\x1b[58;2;95;149;95m")
+		active.WriteString("\x1b[58;2;143;157;106m")
 	case Del:
-		active.WriteString("\x1b[58;5;203m")
+		active.WriteString("\x1b[58;2;207;106;76m")
 	}
 	activeSGR := active.String()
 	if activeSGR == "" {

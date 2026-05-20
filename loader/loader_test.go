@@ -438,3 +438,91 @@ func TestParallelLoadsDoNotInterfere(t *testing.T) {
 		t.Fatalf("only %d/16 parallel loads succeeded", ok.Load())
 	}
 }
+
+func TestLoadNumStatPrefetch_MarksResultAsPrefetch(t *testing.T) {
+	f := newFakeSource()
+	f.numStatResult["abc"] = []gitcmd.FileStat{{Status: "M", Path: "main.go"}}
+	l := New(Config{Source: f, Debounce: 1 * time.Millisecond})
+
+	res := (<-runMsg(l.LoadNumStatPrefetch("abc"))).(NumStatResult)
+	if !res.Prefetch {
+		t.Error("Prefetch flag should be true on fresh prefetch result")
+	}
+	if res.Cached {
+		t.Error("first call should not be Cached")
+	}
+	if res.SHA != "abc" || len(res.Files) != 1 || res.Files[0].Path != "main.go" {
+		t.Errorf("unexpected result: %+v", res)
+	}
+	if res.Err != nil {
+		t.Errorf("err = %v", res.Err)
+	}
+
+	// Second call hits the cache and is still marked Prefetch.
+	res2 := (<-runMsg(l.LoadNumStatPrefetch("abc"))).(NumStatResult)
+	if !res2.Prefetch {
+		t.Error("Prefetch flag should be true on cached prefetch result")
+	}
+	if !res2.Cached {
+		t.Error("second call should be Cached")
+	}
+}
+
+func TestLoadNumStatPrefetch_DoesNotCancelInFlightLoadNumStat(t *testing.T) {
+	f := newFakeSource()
+	f.numStatGate = make(chan struct{})
+	f.numStatResult["a"] = []gitcmd.FileStat{{Path: "a.go"}}
+	f.numStatResult["b"] = []gitcmd.FileStat{{Path: "b.go"}}
+	l := New(Config{Source: f, Debounce: 1 * time.Millisecond})
+
+	// Kick off a selection-driven load and a prefetch concurrently.
+	loadCh := runMsg(l.LoadNumStat("a"))
+	prefCh := runMsg(l.LoadNumStatPrefetch("b"))
+
+	// Release both fakeSource calls so they can finish in any order.
+	close(f.numStatGate)
+
+	loadRes := (<-loadCh).(NumStatResult)
+	prefRes := (<-prefCh).(NumStatResult)
+
+	if loadRes.Err != nil {
+		t.Errorf("selection-driven load should not be cancelled by a parallel prefetch, got err=%v", loadRes.Err)
+	}
+	if loadRes.Prefetch {
+		t.Error("selection-driven load result must not have Prefetch=true")
+	}
+	if !prefRes.Prefetch {
+		t.Error("prefetch result should have Prefetch=true")
+	}
+	if prefRes.Err != nil {
+		t.Errorf("prefetch err = %v", prefRes.Err)
+	}
+}
+
+func TestLoadNumStatPrefetch_NotCancelledByLaterLoadNumStat(t *testing.T) {
+	// LoadNumStat swaps the numstat context, which cancels any
+	// previous LoadNumStat — but a prefetch uses context.Background()
+	// and must survive that swap.
+	f := newFakeSource()
+	f.numStatGate = make(chan struct{})
+	f.numStatResult["pf"] = []gitcmd.FileStat{{Path: "pf.go"}}
+	f.numStatResult["sel"] = []gitcmd.FileStat{{Path: "sel.go"}}
+	l := New(Config{Source: f, Debounce: 1 * time.Millisecond})
+
+	prefCh := runMsg(l.LoadNumStatPrefetch("pf"))
+	// Issuing a new selection-driven load triggers a context swap.
+	loadCh := runMsg(l.LoadNumStat("sel"))
+	close(f.numStatGate)
+
+	prefRes := (<-prefCh).(NumStatResult)
+	loadRes := (<-loadCh).(NumStatResult)
+	if prefRes.Err != nil {
+		t.Errorf("prefetch should not be cancelled by a later LoadNumStat, got err=%v", prefRes.Err)
+	}
+	if !prefRes.Prefetch {
+		t.Error("prefetch result should be marked Prefetch")
+	}
+	if loadRes.Err != nil {
+		t.Errorf("selection load err = %v", loadRes.Err)
+	}
+}

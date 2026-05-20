@@ -7,6 +7,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     flake-utils,
     ...
@@ -14,13 +15,23 @@
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
     in {
+      apps.default = {
+        type = "app";
+        program = builtins.toString (
+          pkgs.writeShellScript
+          "${self.outputs.packages.${system}.default.name}-go_run"
+          ''
+            ${pkgs.go}/bin/go run main.go
+          ''
+        );
+      };
       packages.default = pkgs.buildGoModule {
         pname = "git-review-tui";
-        version = "1.6.0";
-        src = ./.; 
-        vendorHash = "sha256-JkEFpZ3oUCV8ydg8f/yNWwkrDPIaoygPeSSvwx+0qTQ=";
-        buildInputs = [ pkgs.git ];
-        nativeBuildInputs = [ pkgs.git ];
+        version = "1.6.1";
+        src = ./.;
+        vendorHash = "sha256-JKIFZxO3L0cDVbT8ZD/KtDzjBtTuBLkq/e3PSXZ0kaw=";
+        buildInputs = [pkgs.git];
+        nativeBuildInputs = [pkgs.git];
 
         preCheck = ''
           export HOME=$(mktemp -d)
