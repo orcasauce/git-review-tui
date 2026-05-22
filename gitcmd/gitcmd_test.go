@@ -1669,6 +1669,510 @@ func TestRebaseAbort_NoOpWhenNotInProgress(t *testing.T) {
 	}
 }
 
+func TestRebaseEditStart_HaltsAtCursor(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	writeAndCommit(t, repo, "b.txt", "b\n", "second")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "c.txt", "c\n", "third")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, nil, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt (stderr=%q)", res.State, res.Stderr)
+	}
+	if res.HaltSHA != cursorSHA {
+		t.Errorf("HaltSHA = %q, want %q", res.HaltSHA, cursorSHA)
+	}
+	if res.HaltSubject != "second" {
+		t.Errorf("HaltSubject = %q, want %q", res.HaltSubject, "second")
+	}
+	if len(res.ConflictedPaths) != 0 {
+		t.Errorf("ConflictedPaths = %v, want empty for an edit halt", res.ConflictedPaths)
+	}
+	if err := c.RebaseAbort(ctx); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+}
+
+func TestRebaseEditStart_CombinesDropAndEdit(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	writeAndCommit(t, repo, "b.txt", "b\n", "drop me")
+	dropSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "c.txt", "c\n", "keep me")
+	writeAndCommit(t, repo, "d.txt", "d\n", "edit me")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "e.txt", "e\n", "after cursor")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, []string{dropSHA}, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt (stderr=%q)", res.State, res.Stderr)
+	}
+	// b.txt (drop) must already be gone at the edit halt because the
+	// drop step preceded the edit step in chronological order.
+	if _, err := os.Stat(filepath.Join(repo, "b.txt")); err == nil {
+		t.Errorf("b.txt still present at edit halt; drop should have run first")
+	}
+	// d.txt (the cursor commit) is present — we're halted *on* it.
+	if _, err := os.Stat(filepath.Join(repo, "d.txt")); err != nil {
+		t.Errorf("d.txt missing at edit halt: %v", err)
+	}
+	if err := c.RebaseAbort(ctx); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+}
+
+func TestRebaseEditStart_EmptyCursorErrors(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.RebaseEditStart(ctx, "", nil, false); err == nil {
+		t.Errorf("RebaseEditStart(\"\") returned nil error, want one")
+	}
+}
+
+func TestRebaseEditStart_DropConflictSurfaces(t *testing.T) {
+	// A drop upstream of the cursor that conflicts with a downstream
+	// commit halts the rebase with RebaseHalted (not RebaseEditHalt)
+	// before the cursor is reached.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	writeAndCommit(t, repo, "f.txt", "v1\n", "introduce f")
+	introduceSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "f.txt", "v2\n", "update f")
+	writeAndCommit(t, repo, "g.txt", "g\n", "cursor commit")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, []string{introduceSHA}, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseHalted {
+		t.Fatalf("State = %v, want RebaseHalted (stderr=%q)", res.State, res.Stderr)
+	}
+	if len(res.ConflictedPaths) == 0 {
+		t.Errorf("ConflictedPaths empty; expected at least f.txt")
+	}
+	if err := c.RebaseAbort(ctx); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+}
+
+func TestRebaseEditStart_EmptyCommitDropped(t *testing.T) {
+	// A commit that *becomes* empty after an upstream drop must be
+	// removed by `--empty=drop`. Setup:
+	//   seed: f.txt = "base\n"
+	//   A:    f.txt = "base\nextra\n"          (adds "extra")
+	//   B:    f.txt = "base\n"                  (removes "extra")
+	//   C:    g.txt = "g\n"                     (cursor)
+	// After dropping A, B's diff is "base -> base" which is empty.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "f.txt", "base\n", "seed")
+	writeAndCommit(t, repo, "f.txt", "base\nextra\n", "A: add extra")
+	dropSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "f.txt", "base\n", "B: remove extra (empty after A drop)")
+	writeAndCommit(t, repo, "g.txt", "g\n", "C: cursor")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, []string{dropSHA}, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt (stderr=%q)", res.State, res.Stderr)
+	}
+	subjects := gitOut(t, repo, "log", "--format=%s", "HEAD")
+	if strings.Contains(subjects, "B: remove extra") {
+		t.Errorf("empty commit B was not dropped (subjects=%q)", subjects)
+	}
+	if err := c.RebaseAbort(ctx); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+}
+
+func TestRebaseEditStart_CursorAsDrop(t *testing.T) {
+	// Auto-promote path: cursor commit's todo entry is `drop` instead
+	// of `edit`. The rebase completes (RebaseDone) without halting at
+	// the cursor; the cursor commit's tree change is gone from HEAD.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	writeAndCommit(t, repo, "b.txt", "b\n", "drop me as cursor")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "c.txt", "c\n", "after cursor")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, nil, true)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseDone {
+		t.Fatalf("State = %v, want RebaseDone (stderr=%q)", res.State, res.Stderr)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "b.txt")); err == nil {
+		t.Errorf("b.txt still present; cursor commit should have been dropped")
+	}
+	subjects := gitOut(t, repo, "log", "--format=%s")
+	if strings.Contains(subjects, "drop me as cursor") {
+		t.Errorf("dropped cursor subject still present: %q", subjects)
+	}
+	if !strings.Contains(subjects, "after cursor") {
+		t.Errorf("downstream commit missing from log: %q", subjects)
+	}
+}
+
+func TestRebaseEditStart_CursorAsDropWithDrops(t *testing.T) {
+	// Combined auto-promote: cursor commit + upstream drop both go away
+	// in chronological order; downstream commit replays past both.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "a.txt", "a\n", "first")
+	writeAndCommit(t, repo, "b.txt", "b\n", "drop upstream")
+	dropSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "c.txt", "c\n", "between")
+	writeAndCommit(t, repo, "d.txt", "d\n", "cursor full-revert")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "e.txt", "e\n", "downstream")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, []string{dropSHA}, true)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseDone {
+		t.Fatalf("State = %v, want RebaseDone (stderr=%q)", res.State, res.Stderr)
+	}
+	for _, path := range []string{"b.txt", "d.txt"} {
+		if _, err := os.Stat(filepath.Join(repo, path)); err == nil {
+			t.Errorf("%s still present after auto-promoted combined rebase", path)
+		}
+	}
+	subjects := gitOut(t, repo, "log", "--format=%s")
+	if !strings.Contains(subjects, "downstream") || !strings.Contains(subjects, "between") || !strings.Contains(subjects, "first") {
+		t.Errorf("surviving commits missing from log: %q", subjects)
+	}
+}
+
+func TestApplyReverse3Way_CleanApply(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "f.txt", "line1\nline2\nline3\n", "v1")
+	// Add a fourth line in a new commit so we can revert that addition.
+	writeAndCommit(t, repo, "f.txt", "line1\nline2\nline3\nline4\n", "v2")
+	// Build the unified-diff text for v2 (the addition of line4).
+	diff := gitOut(t, repo, "show", "--format=", "HEAD", "--", "f.txt")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	unmerged, err := c.ApplyReverse3Way(ctx, map[string]string{"f.txt": diff})
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way: %v", err)
+	}
+	if len(unmerged) != 0 {
+		t.Errorf("unmerged = %v, want empty for a clean reverse apply", unmerged)
+	}
+	// The file should now match v1.
+	got, err := os.ReadFile(filepath.Join(repo, "f.txt"))
+	if err != nil {
+		t.Fatalf("read f.txt: %v", err)
+	}
+	if string(got) != "line1\nline2\nline3\n" {
+		t.Errorf("f.txt = %q, want v1 content", string(got))
+	}
+}
+
+func TestApplyReverse3Way_EmptyInputNoop(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "f.txt", "ok\n", "first")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unmerged, err := c.ApplyReverse3Way(ctx, nil)
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way(nil): %v", err)
+	}
+	if unmerged != nil {
+		t.Errorf("unmerged = %v, want nil", unmerged)
+	}
+}
+
+func TestApplyReverse3Way_ConflictLeavesUnmerged(t *testing.T) {
+	// Reverse-apply a v1->v2 diff against a commit whose file content has
+	// drifted in lines surrounding the change. With --3way, git resolves
+	// what it can and inserts conflict markers where it cannot, leaving
+	// the path unmerged.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "f.txt", "alpha\nbeta\ngamma\n", "v1")
+	writeAndCommit(t, repo, "f.txt", "alpha\nBETA\ngamma\n", "v2")
+	diff := gitOut(t, repo, "show", "--format=", "HEAD", "--", "f.txt")
+	// Drift in a fresh commit so worktree and index agree (required for
+	// `git apply --3way` to even start).
+	writeAndCommit(t, repo, "f.txt", "DRIFT_TOP\nbeta\nDRIFT_BOT\n", "drift")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	unmerged, err := c.ApplyReverse3Way(ctx, map[string]string{"f.txt": diff})
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way: %v", err)
+	}
+	if len(unmerged) == 0 {
+		got, _ := os.ReadFile(filepath.Join(repo, "f.txt"))
+		t.Errorf("unmerged = empty; expected f.txt to be unmerged. file now=%q", string(got))
+	}
+}
+
+func TestAmendNoEdit_FoldsWorktreeChanges(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "f.txt", "v1\n", "subject one")
+	headBefore := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	subjectBefore := strings.TrimSpace(gitOut(t, repo, "log", "-1", "--format=%s"))
+	// Mutate the worktree; AmendNoEdit should stage + amend.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatalf("write f.txt: %v", err)
+	}
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := c.AmendNoEdit(ctx); err != nil {
+		t.Fatalf("AmendNoEdit: %v", err)
+	}
+	headAfter := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	if headAfter == headBefore {
+		t.Errorf("HEAD unchanged after amend")
+	}
+	subjectAfter := strings.TrimSpace(gitOut(t, repo, "log", "-1", "--format=%s"))
+	if subjectAfter != subjectBefore {
+		t.Errorf("subject changed: got %q, want %q", subjectAfter, subjectBefore)
+	}
+	content := strings.TrimSpace(gitOut(t, repo, "show", "HEAD:f.txt"))
+	if content != "v2" {
+		t.Errorf("HEAD:f.txt = %q, want %q", content, "v2")
+	}
+}
+
+func TestRebaseEditStart_FullFlow_ApplyAmendContinue(t *testing.T) {
+	// End-to-end: rebase halts at the cursor, ApplyReverse3Way removes
+	// the cursor's change, AmendNoEdit folds the result, RebaseContinue
+	// finishes. The cursor commit's subject survives; its file change
+	// disappears.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "seed.txt", "seed\n", "seed")
+	writeAndCommit(t, repo, "f.txt", "alpha\nbeta\ngamma\n", "introduce f")
+	writeAndCommit(t, repo, "f.txt", "alpha\nbeta\ngamma\nDELTA\n", "add DELTA")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	diff := gitOut(t, repo, "show", "--format=", cursorSHA, "--", "f.txt")
+	writeAndCommit(t, repo, "g.txt", "g\n", "after cursor")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, nil, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt", res.State)
+	}
+	unmerged, err := c.ApplyReverse3Way(ctx, map[string]string{"f.txt": diff})
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way: %v", err)
+	}
+	if len(unmerged) != 0 {
+		t.Fatalf("unmerged = %v, want empty", unmerged)
+	}
+	if err := c.AmendNoEdit(ctx); err != nil {
+		t.Fatalf("AmendNoEdit: %v", err)
+	}
+	cont, err := c.RebaseContinue(ctx)
+	if err != nil {
+		t.Fatalf("RebaseContinue: %v", err)
+	}
+	if cont.State != RebaseDone {
+		t.Fatalf("State = %v, want RebaseDone (stderr=%q)", cont.State, cont.Stderr)
+	}
+	// "add DELTA" subject still present; the line itself gone.
+	subjects := gitOut(t, repo, "log", "--format=%s")
+	if !strings.Contains(subjects, "add DELTA") {
+		t.Errorf("subjects = %q, expected to retain \"add DELTA\"", subjects)
+	}
+	got, err := os.ReadFile(filepath.Join(repo, "f.txt"))
+	if err != nil {
+		t.Fatalf("read f.txt: %v", err)
+	}
+	if string(got) != "alpha\nbeta\ngamma\n" {
+		t.Errorf("f.txt = %q, want the pre-DELTA content", string(got))
+	}
+}
+
+func TestRebaseEditStart_ApplyConflict_ResolveAmendContinue(t *testing.T) {
+	// End-to-end: rebase halts at the cursor; ApplyReverse3Way leaves
+	// f.txt unmerged because the patch's pre-image context has drifted
+	// from HEAD; CheckoutSide + AmendNoEdit + RebaseContinue resolves
+	// the conflict and finishes the rebase.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "seed.txt", "seed\n", "seed")
+	writeAndCommit(t, repo, "f.txt", "alpha\nbeta\ngamma\n", "introduce f")
+	writeAndCommit(t, repo, "f.txt", "alpha\nSTALE\ngamma\n", "stale snapshot")
+	// Capture the diff that turns "beta" into "STALE". Reverse-applying
+	// this patch against a different f.txt context will conflict.
+	staleDiff := gitOut(t, repo, "show", "--format=", "HEAD", "--", "f.txt")
+	// Cursor commit drifts the context lines around the modified slot so
+	// the reverse apply can't simply roll the patch back.
+	writeAndCommit(t, repo, "f.txt", "DRIFT_TOP\nbeta\nDRIFT_BOT\n", "cursor: drift context")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	writeAndCommit(t, repo, "g.txt", "g\n", "downstream")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, nil, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt (stderr=%q)", res.State, res.Stderr)
+	}
+	unmerged, err := c.ApplyReverse3Way(ctx, map[string]string{"f.txt": staleDiff})
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way: %v", err)
+	}
+	if len(unmerged) == 0 {
+		got, _ := os.ReadFile(filepath.Join(repo, "f.txt"))
+		t.Fatalf("unmerged empty; expected apply-step conflict. f.txt=%q", string(got))
+	}
+	// Resolve by picking "theirs" — the side of the conflict matching
+	// HEAD at the edit halt — and then fold the staged tree into the
+	// cursor commit before continuing.
+	if err := c.CheckoutSide(ctx, SideTheirs, unmerged); err != nil {
+		t.Fatalf("CheckoutSide: %v", err)
+	}
+	if err := c.AmendNoEdit(ctx); err != nil {
+		t.Fatalf("AmendNoEdit: %v", err)
+	}
+	cont, err := c.RebaseContinue(ctx)
+	if err != nil {
+		t.Fatalf("RebaseContinue: %v", err)
+	}
+	if cont.State != RebaseDone {
+		t.Fatalf("State = %v, want RebaseDone (stderr=%q)", cont.State, cont.Stderr)
+	}
+	// Worktree must be clean — no leftover unmerged paths, no conflict
+	// markers — and the post-rebase log must still carry the downstream
+	// commit's subject so we know it replayed past the cursor.
+	info, err := c.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(info.UnmergedPaths) != 0 {
+		t.Errorf("UnmergedPaths = %v, want empty after RebaseDone", info.UnmergedPaths)
+	}
+	subjects := gitOut(t, repo, "log", "--format=%s")
+	if !strings.Contains(subjects, "downstream") {
+		t.Errorf("subjects = %q, want it to contain \"downstream\"", subjects)
+	}
+}
+
+func TestRebaseEditStart_CascadeConflict_ResolveAndContinue(t *testing.T) {
+	// End-to-end: clean apply + amend folds the reverse hunk into the
+	// cursor commit, then RebaseContinue halts on a downstream commit
+	// that depended on the now-removed content. CheckoutSide +
+	// RebaseContinue resolves the cascade and finishes the rebase.
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeAndCommit(t, repo, "seed.txt", "seed\n", "seed")
+	writeAndCommit(t, repo, "f.txt", "v1\n", "introduce f")
+	writeAndCommit(t, repo, "f.txt", "v2\n", "cursor: v1->v2")
+	cursorSHA := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	cursorDiff := gitOut(t, repo, "show", "--format=", cursorSHA, "--", "f.txt")
+	writeAndCommit(t, repo, "f.txt", "v3\n", "downstream: v2->v3")
+
+	c := New(repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := c.RebaseEditStart(ctx, cursorSHA, nil, false)
+	if err != nil {
+		t.Fatalf("RebaseEditStart: %v", err)
+	}
+	if res.State != RebaseEditHalt {
+		t.Fatalf("State = %v, want RebaseEditHalt (stderr=%q)", res.State, res.Stderr)
+	}
+	unmerged, err := c.ApplyReverse3Way(ctx, map[string]string{"f.txt": cursorDiff})
+	if err != nil {
+		t.Fatalf("ApplyReverse3Way: %v", err)
+	}
+	if len(unmerged) != 0 {
+		t.Fatalf("unmerged = %v, want empty (clean apply)", unmerged)
+	}
+	if err := c.AmendNoEdit(ctx); err != nil {
+		t.Fatalf("AmendNoEdit: %v", err)
+	}
+	cont, err := c.RebaseContinue(ctx)
+	if err != nil {
+		t.Fatalf("RebaseContinue: %v", err)
+	}
+	if cont.State != RebaseHalted {
+		t.Fatalf("State = %v, want RebaseHalted (cascade); stderr=%q", cont.State, cont.Stderr)
+	}
+	if len(cont.ConflictedPaths) == 0 {
+		t.Errorf("cascade halt ConflictedPaths empty; expected at least f.txt")
+	}
+	if err := c.CheckoutSide(ctx, SideTheirs, cont.ConflictedPaths); err != nil {
+		t.Fatalf("CheckoutSide: %v", err)
+	}
+	final, err := c.RebaseContinue(ctx)
+	if err != nil {
+		t.Fatalf("RebaseContinue (after resolve): %v", err)
+	}
+	if final.State != RebaseDone {
+		t.Fatalf("final State = %v, want RebaseDone (stderr=%q)", final.State, final.Stderr)
+	}
+	info, err := c.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(info.UnmergedPaths) != 0 {
+		t.Errorf("UnmergedPaths = %v, want empty after RebaseDone", info.UnmergedPaths)
+	}
+}
+
 // gitOut runs git in dir and returns stdout, failing the test on error.
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()

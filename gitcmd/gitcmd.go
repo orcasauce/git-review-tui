@@ -881,6 +881,10 @@ const (
 	// RebaseError means git rebase exited non-zero with no mid-rebase
 	// state — i.e. a generic failure that did not start, or rolled back.
 	RebaseError
+	// RebaseEditHalt means git rebase stopped at an `edit` todo step with
+	// no unmerged paths; the caller is expected to mutate the worktree
+	// (e.g. apply reverse hunks), stage the result, amend, and continue.
+	RebaseEditHalt
 )
 
 // RebaseResult describes the outcome of a RebaseDropStart /
@@ -982,6 +986,166 @@ func (c *Client) RebaseDropStart(ctx context.Context, marked []string) (RebaseRe
 		result.ConflictedPaths = info.UnmergedPaths
 	}
 	return result, nil
+}
+
+// RebaseEditStart runs `git rebase -i --rebase-merges --empty=drop <base>`
+// with a generated sequence-editor script that rewrites cursorSHA's
+// `pick` line to `edit` (or `drop` when cursorAsDrop is true) and every
+// drop's `pick` line to `drop`. The rebase therefore halts at cursorSHA
+// for the edit case so the caller can apply reverse hunks, amend, and
+// continue. base is the parent of the oldest sha in {cursorSHA} ∪ drops.
+//
+// On halt at the edit step with no unmerged paths, State=RebaseEditHalt
+// and HaltSHA/HaltSubject are populated. A conflict halt (which can
+// occur before reaching cursorSHA if a drop introduces a downstream
+// conflict) returns State=RebaseHalted with ConflictedPaths populated,
+// matching RebaseDropStart's semantics. RebaseDone is returned when
+// every drop and the cursor commit complete cleanly without halting —
+// the expected outcome when cursorAsDrop is true (the cursor is removed
+// like any other drop, no edit halt occurs) or when --empty=drop has
+// elided the cursor commit too.
+func (c *Client) RebaseEditStart(ctx context.Context, cursorSHA string, drops []string, cursorAsDrop bool) (RebaseResult, error) {
+	if cursorSHA == "" {
+		return RebaseResult{}, errors.New("gitcmd.RebaseEditStart: empty cursorSHA")
+	}
+	// Find the oldest affected sha to choose the rebase base.
+	affected := append([]string{cursorSHA}, drops...)
+	oldest := ""
+	minCount := -1
+	for _, sha := range affected {
+		cnt, err := c.revListCount(ctx, sha)
+		if err != nil {
+			return RebaseResult{}, err
+		}
+		if minCount < 0 || cnt < minCount {
+			minCount = cnt
+			oldest = sha
+		}
+	}
+	tmpdir, err := os.MkdirTemp("", "git-review-tui-rebase-")
+	if err != nil {
+		return RebaseResult{}, &Error{Op: "mkdir tempdir", Err: err}
+	}
+	defer os.RemoveAll(tmpdir)
+	scriptPath := filepath.Join(tmpdir, "sequence-editor.sh")
+	cursorVerb := "edit"
+	if cursorAsDrop {
+		cursorVerb = "drop"
+	}
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	script.WriteString("todofile=\"$1\"\n")
+	script.WriteString("sed ")
+	script.WriteString("-e 's/^pick " + cursorSHA + "/" + cursorVerb + " " + cursorSHA + "/' ")
+	for _, sha := range drops {
+		script.WriteString("-e 's/^pick " + sha + "/drop " + sha + "/' ")
+	}
+	script.WriteString("\"$todofile\" > \"$todofile.new\" && mv \"$todofile.new\" \"$todofile\"\n")
+	if err := os.WriteFile(scriptPath, []byte(script.String()), 0o755); err != nil {
+		return RebaseResult{}, &Error{Op: "write sequence editor", Err: err}
+	}
+	base := oldest + "~1"
+	cmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"-c", "core.abbrev=40",
+		"-c", "sequence.editor="+scriptPath,
+		"rebase", "-i", "--rebase-merges", "--empty=drop", base,
+	)
+	cmd.Env = append(os.Environ(), "GIT_EDITOR=true")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	result := RebaseResult{Stderr: stderr.String()}
+	inProgress, _ := c.rebaseInProgress(ctx)
+	if !inProgress {
+		if runErr == nil {
+			result.State = RebaseDone
+		} else {
+			result.State = RebaseError
+		}
+		return result, nil
+	}
+	// Mid-rebase on disk: edit halt or conflict halt? An edit halt has
+	// no unmerged paths; a conflict halt has at least one.
+	if info, statusErr := c.Status(ctx); statusErr == nil && len(info.UnmergedPaths) > 0 {
+		result.State = RebaseHalted
+		result.ConflictedPaths = info.UnmergedPaths
+	} else {
+		result.State = RebaseEditHalt
+	}
+	if haltSHA, _ := c.readStoppedSHA(ctx); haltSHA != "" {
+		result.HaltSHA = haltSHA
+		if subj, err := c.commitSubject(ctx, haltSHA); err == nil {
+			result.HaltSubject = subj
+		}
+	}
+	return result, nil
+}
+
+// ApplyReverse3Way runs `git apply -R --3way` on each per-file patch in
+// perFilePatches. The map key is the file path (informational; the patch
+// text carries its own headers); the value is the combined per-file
+// patch as produced by hunkpatch.CombineForFile. Each patch is fed via
+// stdin so no temp files are needed.
+//
+// Returns the list of unmerged paths in the index after every patch has
+// been attempted — empty when every patch applied cleanly. A failing
+// apply is non-fatal: --3way leaves conflict markers in the worktree
+// and those paths surface in the unmerged set. Empty input returns
+// (nil, nil) without invoking git.
+func (c *Client) ApplyReverse3Way(ctx context.Context, perFilePatches map[string]string) ([]string, error) {
+	if len(perFilePatches) == 0 {
+		return nil, nil
+	}
+	for _, patch := range perFilePatches {
+		if patch == "" {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, "git",
+			"-C", c.workTreePath,
+			"apply", "-R", "--3way",
+		)
+		cmd.Stdin = strings.NewReader(patch)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		// A non-zero exit is expected on conflict (--3way still leaves
+		// markers in the worktree); we rely on the post-loop status
+		// scan to enumerate unmerged paths.
+		_ = cmd.Run()
+	}
+	info, err := c.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return info.UnmergedPaths, nil
+}
+
+// AmendNoEdit stages all tracked-file modifications and amends the
+// current HEAD commit with no message change. Used after the
+// ApplyReverse3Way step at a RebaseEditHalt to fold the reverse hunks
+// into the cursor commit before `rebase --continue` advances the rebase.
+func (c *Client) AmendNoEdit(ctx context.Context) error {
+	addCmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"add", "-u",
+	)
+	var addStderr bytes.Buffer
+	addCmd.Stderr = &addStderr
+	if err := addCmd.Run(); err != nil {
+		return &Error{Op: "add -u", Err: err, Stderr: addStderr.String()}
+	}
+	commitCmd := exec.CommandContext(ctx, "git",
+		"-C", c.workTreePath,
+		"commit", "--amend", "--no-edit", "--allow-empty",
+	)
+	commitCmd.Env = append(os.Environ(), "GIT_EDITOR=true")
+	var commitStderr bytes.Buffer
+	commitCmd.Stderr = &commitStderr
+	if err := commitCmd.Run(); err != nil {
+		return &Error{Op: "commit --amend --no-edit", Err: err, Stderr: commitStderr.String()}
+	}
+	return nil
 }
 
 // ConflictSide picks which side of a conflict to take when resolving

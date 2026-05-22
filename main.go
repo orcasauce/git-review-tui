@@ -18,12 +18,15 @@ import (
 
 	"github.com/orcasauce/git-review-tui/diffrender"
 	"github.com/orcasauce/git-review-tui/filefilter"
+	"github.com/orcasauce/git-review-tui/fileid"
 	"github.com/orcasauce/git-review-tui/filelist"
 	"github.com/orcasauce/git-review-tui/gitcmd"
+	"github.com/orcasauce/git-review-tui/hunkpatch"
 	"github.com/orcasauce/git-review-tui/hunkstate"
 	"github.com/orcasauce/git-review-tui/layout"
 	"github.com/orcasauce/git-review-tui/loader"
 	"github.com/orcasauce/git-review-tui/metadata"
+	"github.com/orcasauce/git-review-tui/revertstate"
 )
 
 type section int
@@ -115,8 +118,9 @@ type model struct {
 	// diff is the parsed unified diff for the currently-selected
 	// (commit, file) pair. diffSHA / diffPath identify which selection
 	// the parsed result belongs to (so stale loads can be discarded).
-	// diffScroll is the vertical line offset and diffHScroll is the
-	// horizontal character offset into the diff panel.
+	// diffScroll is the row offset into the diff panel's visible-row
+	// view (rows hidden by a flagged hunk's Add-collapse don't count)
+	// and diffHScroll is the horizontal character offset.
 	diff        diffrender.Result
 	diffSHA     string
 	diffPath    string
@@ -130,6 +134,31 @@ type model struct {
 	// last position.
 	activeHunk int
 	hunks      *hunkstate.Tracker
+	// reverts tracks revert marks on individual hunks across the
+	// session. `d` while the diff panel is focused toggles a mark on
+	// the active hunk; rendering surfaces flagged hunks as a grey
+	// "tombstone" block in the diff (prd-hunk-revert.md, slice 07).
+	reverts *revertstate.Tracker
+	// fileIDs is the stable-identity registry that translates raw paths
+	// into FileIDs. Marks in revertstate are keyed by FileID so a file
+	// can be followed across renames and so the post-rebase adoption
+	// walk can match a moved hunk by (FileID, HunkHash). Seeded from
+	// rename information on each NumStatResult.
+	fileIDs *fileid.Registry
+	// diffHunks is the default-context (non-`-U99999`) diff for the
+	// currently-loaded (diffSHA, diffPath). It is cached here so that
+	// toggleRevertMark can extract the active hunk's text and compute
+	// its canonical content hash without re-running git.
+	diffHunks string
+	// hunkTotals caches the total hunk count per (sha, path) for files
+	// the user has visited. Keyed by sha + "\x00" + path. Populated on
+	// each DiffResult and consumed by slice-08 display logic to decide
+	// whether a file is fully flagged and a commit auto-promotes to D.
+	hunkTotals map[string]int
+	// filesByCommit caches the file list per commit sha, populated on
+	// each FilesResult. Used alongside hunkTotals to compute the
+	// commit-wide total hunk count for the auto-promote-to-D rule.
+	filesByCommit map[string][]gitcmd.FileStat
 	// detailLoading / filesLoading / diffLoading track whether each
 	// right/bottom panel is currently waiting on the loader. When true,
 	// the panel title shows a spinner and the body (if any prior content
@@ -276,7 +305,75 @@ type model struct {
 	// is pressed while unmerged paths remain. Renders the list in the
 	// popup so the user knows exactly what is still unresolved.
 	rebaseManualUnmerged []string
+
+	// rebaseFlow identifies which kind of ctrl+s pipeline is currently
+	// staged or in flight: a drop-only rebase (existing behaviour) or
+	// the cursor-commit revert rebase introduced by slice 10. The field
+	// is set by startSave once the routing decision has been made and
+	// drives confirmRebase, the running popup, and the done handler.
+	rebaseFlow rebaseFlowKind
+	// rebaseRevertSnapshot holds the pre-confirm revertstate snapshot.
+	// On any cancel/error path the tracker is restored to this state so
+	// the user does not lose flagged hunks they had not yet processed.
+	rebaseRevertSnapshot revertstate.Snapshot
+	// rebaseRevertCursorSHA is the cursor commit whose revert marks are
+	// being processed by the active rebase.
+	rebaseRevertCursorSHA string
+	// rebaseRevertPatches is the per-file reverse patch map keyed by the
+	// path at the cursor commit. Built synchronously at startSave so any
+	// DiffHunks failure short-circuits before the rebase begins.
+	rebaseRevertPatches map[string]string
+	// rebaseRevertCount is the total hunk count being reverted. Used
+	// purely for the success status message.
+	rebaseRevertCount int
+	// rebaseRevertDrops carries the drop-SHA list co-processed with the
+	// cursor commit's reverts when ctrl-s combined both kinds of marks.
+	// Drops are not removed from pendingActions until the rebase succeeds,
+	// so cancel paths leave the user's marks in place.
+	rebaseRevertDrops []string
+	// rebaseRevertAutoPromote signals that every hunk on the cursor commit
+	// is flagged, so the cursor's todo entry becomes `drop` rather than
+	// `edit` and the apply / amend steps are skipped. The end state is
+	// equivalent to an empty amend + --empty=drop, but cleaner.
+	rebaseRevertAutoPromote bool
+	// rebaseRevertAtApply tracks whether the conflict popup currently
+	// up is for an apply-step conflict (ApplyReverse3Way left unmerged
+	// paths at the edit halt) versus a cascade conflict (a downstream
+	// commit halted after the cursor was amended and continued). The
+	// distinction drives the resume path: apply-step resolutions still
+	// need AmendNoEdit to fold the resolved tree into the cursor
+	// commit; cascade resolutions go straight to RebaseContinue.
+	rebaseRevertAtApply bool
+
+	// adoptionTable carries the (FileID, HunkHash) → count multiset of
+	// pre-rebase revert marks queued for re-attachment onto the rewritten
+	// history. Built in handleRevertDone success after cursor + drop
+	// marks are cleared, consumed by the post-refresh walk in
+	// handleAdoptionDone, cleared on the same. Survives nothing — every
+	// exit path (success, cancel, worktree switch) zeroes it.
+	adoptionTable map[revertstate.AdoptionKey]int
+	// adoptionTotal is the count of marks staged for adoption when the
+	// table was built. The discard count surfaced post-walk is
+	// adoptionTotal minus the number of marks that found a home.
+	adoptionTotal int
+	// adoptionWanted is the set of hashes referenced by adoptionTable.
+	// The walk goroutine uses it to discard non-matching hunks at
+	// hash-time, keeping the candidate stream proportional to the
+	// flagged set rather than to the entire log.
+	adoptionWanted map[string]struct{}
 }
+
+// rebaseFlowKind distinguishes the drop-only pipeline (existing
+// RebaseDropStart) from the unified revert pipeline (RebaseEditStart),
+// which now also handles combined drop + cursor-commit revert and the
+// auto-promote case where every hunk on the cursor commit is flagged.
+type rebaseFlowKind int
+
+const (
+	rebaseFlowNone rebaseFlowKind = iota
+	rebaseFlowDrop
+	rebaseFlowRevert
+)
 
 // rebaseUIState tracks which rebase popup is currently up. Most
 // rebase-state transitions are driven by tea.Msg deliveries from the
@@ -305,6 +402,10 @@ func initialModel(git *gitcmd.Client, branch, worktreeLabel string) model {
 		pendingActions: map[string]ActionKind{},
 		activeHunk:     hunkstate.NoActiveHunk,
 		hunks:          hunkstate.New(),
+		reverts:        revertstate.New(),
+		fileIDs:        fileid.New(),
+		hunkTotals:     map[string]int{},
+		filesByCommit:  map[string][]gitcmd.FileStat{},
 	}
 }
 
@@ -378,6 +479,61 @@ type rebaseDoneMsg struct {
 	result    gitcmd.RebaseResult
 	cancelled bool
 	err       error
+}
+
+// revertDoneMsg delivers the outcome of the runRebaseRevertCmd
+// goroutine (and its resume sibling). A halted outcome routes through
+// the conflict popup; cancel/err go through the abort-and-restore
+// path; done is the success case.
+//
+// cancelled = esc on the blocking modal.
+// err = gitcmd-level failure (start, apply, amend, continue).
+// halted = either ApplyReverse3Way produced unmerged paths or
+//   RebaseContinue returned RebaseHalted on a downstream commit.
+// atApply = halted at the apply step (true) vs. at a cascade
+//   replay step from RebaseContinue (false). Drives whether the
+//   resume path runs AmendNoEdit before RebaseContinue.
+// midRebase = a mid-rebase state needs `git rebase --abort` cleanup.
+// done = the whole pipeline ran to RebaseDone.
+type revertDoneMsg struct {
+	cancelled  bool
+	err        error
+	halted     bool
+	atApply    bool
+	midRebase  bool
+	done       bool
+	conflicted []string
+	haltSHA    string
+	haltSubj   string
+	stderr     string
+}
+
+// adoptionCandidate is one hunk in the new history whose canonical
+// hash matched a hash in the adoption table. The main thread resolves
+// path → FileID and calls revertstate.Adopt to perform the actual
+// re-attachment (the goroutine has no safe access to the registry).
+type adoptionCandidate struct {
+	path string
+	idx  int
+	hash string
+}
+
+// adoptionCommitData groups one new-history commit's rename events with
+// the candidates extracted from its diff. Rename events are replayed
+// onto the fileid registry on the main thread immediately before that
+// commit's candidates are processed, so the FileID lookup matches the
+// state the registry would have been in during a normal walk.
+type adoptionCommitData struct {
+	sha        string
+	files      []gitcmd.FileStat
+	candidates []adoptionCandidate
+}
+
+// adoptionDoneMsg delivers the post-rebase walk's output. The main
+// thread iterates commits oldest → newest, seeds the registry per
+// commit, and adopts each candidate against the saved adoption table.
+type adoptionDoneMsg struct {
+	commits []adoptionCommitData
 }
 
 // raiseStatus shows a transient non-error message in the status row
@@ -523,7 +679,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if pref := m.nextPrefetchCmd(); pref != nil {
 				cmds = append(cmds, pref)
 			}
+			// Post-rebase adoption walk: after handleRevertDone parked
+			// the (FileID, HunkHash) multiset on the model, the first
+			// log refresh that arrives with non-empty commits is the
+			// trigger to re-attach those marks against the new history.
+			if cmd := m.maybeStartAdoptionWalk(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 			return m, tea.Batch(cmds...)
+		}
+		// A first load whose commit list came back empty (every commit
+		// was dropped) still needs to flush adoption state — every
+		// queued mark counts as a discard. Equivalent to running the
+		// walk with no candidates.
+		if firstLoad && len(m.commits) == 0 && m.adoptionTable != nil {
+			return m, m.flushAdoptionAsDiscards()
 		}
 		// Newly arrived commits (pagination) need dim-state population too.
 		if pref := m.nextPrefetchCmd(); pref != nil {
@@ -584,6 +754,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.commitFilterMatch[msg.SHA] = commitMatchesFileFilter(msg.Files, m.fileFilterExpr)
 		}
+		m.seedFileIDs(msg.Files)
 		if msg.Prefetch {
 			// Prefetch results only populate the dim map; they never
 			// drive the files pane. Chain the next prefetch.
@@ -598,6 +769,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filesSelectedIdx = 0
 		m.filesViewportTop = 0
 		m.filesLoading = false
+		if m.filesByCommit == nil {
+			m.filesByCommit = map[string][]gitcmd.FileStat{}
+		}
+		m.filesByCommit[msg.SHA] = msg.Files
 		// The file filter persists across commit selection and refresh,
 		// so the active Expr applies immediately to the new file set.
 		m.recomputeVisibleFiles(-1)
@@ -633,9 +808,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diff = diffrender.Parse(msg.Raw, msg.Hunks, msg.Path)
 		m.diffSHA = msg.SHA
 		m.diffPath = msg.Path
+		m.diffHunks = msg.Hunks
 		m.diffScroll = 0
 		m.diffHScroll = 0
 		m.diffLoading = false
+		fid := m.fileIDs.Resolve(msg.Path)
+		m.diff.SetFlaggedHunks(m.reverts.MarksForFile(msg.SHA, fid))
+		if m.hunkTotals == nil {
+			m.hunkTotals = map[string]int{}
+		}
+		m.hunkTotals[hunkTotalsKey(msg.SHA, msg.Path)] = len(m.diff.HunkStarts)
 		m.activeHunk = m.hunks.Get(msg.SHA, msg.Path, len(m.diff.HunkStarts))
 		m.scrollToActiveHunk()
 		return m, nil
@@ -691,6 +873,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case rebaseDoneMsg:
 		return m.handleRebaseDone(msg)
+
+	case revertDoneMsg:
+		return m.handleRevertDone(msg)
+
+	case adoptionDoneMsg:
+		return m.handleAdoptionDone(msg)
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -871,13 +1059,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case sectionLog:
 				return m, m.pageCommitSelection(1)
 			case sectionFiles:
-				return m, m.pageFileSelection(1)
+				return m, m.toggleRevertMarkFromFiles()
 			case sectionMessage:
 				m.pageMessage(1)
 				return m, nil
 			case sectionDiff:
-				m.pageDiff(1)
-				return m, nil
+				return m, m.toggleRevertMark()
 			}
 		case "u":
 			switch m.active {
@@ -1240,14 +1427,194 @@ func (m *model) toggleDropMark() tea.Cmd {
 	return nil
 }
 
-// startSave is the ctrl+s entry point. With zero marks it flashes
-// `No pending actions` in the status row. Otherwise it runs the full
-// precondition battery and either opens the refuse popup with an
-// actionable message or the action-summary popup. The actual rebase
-// is launched only after the user confirms the summary popup (see
-// confirmRebase below).
+// toggleRevertMark flips a revert mark on the diff panel's
+// currently-active hunk. Returns a tea.Cmd that raises a
+// "No hunks to revert" status message when the current diff has no
+// hunks (binary file, pure rename) or no diff is loaded yet; nil on a
+// successful toggle. After toggling the mark, the diff's flagged-hunk
+// styling is refreshed so the next render shows the tombstone change
+// immediately.
+func (m *model) toggleRevertMark() tea.Cmd {
+	if m.diffSHA == "" || m.diffPath == "" {
+		return m.raiseStatus("No hunks to revert")
+	}
+	if m.activeHunk == hunkstate.NoActiveHunk {
+		return m.raiseStatus("No hunks to revert")
+	}
+	if m.activeHunk < 0 || m.activeHunk >= len(m.diff.HunkStarts) {
+		return m.raiseStatus("No hunks to revert")
+	}
+	id := m.fileIDs.Resolve(m.diffPath)
+	hash := hunkpatch.Hash(hunkpatch.Canonical(
+		hunkpatch.ExtractByIndex(m.diffHunks, m.activeHunk)))
+	m.reverts.Toggle(m.diffSHA, id, m.activeHunk, hash)
+	m.diff.SetFlaggedHunks(m.reverts.MarksForFile(m.diffSHA, id))
+	return nil
+}
+
+// toggleRevertMarkFromFiles flips a revert mark from the file list
+// panel. It targets the currently-selected file, using the
+// most-recently-active hunk for that file (the existing hunkstate
+// tracker, which defaults to hunk 0 for files not yet visited). When
+// the selected file has zero hunks (binary, pure rename, or the diff
+// has not yet loaded), it raises a "No hunks to revert" status.
+//
+// The current selection ordinarily drives an auto-loaded diff (via
+// startDiffForSelection), so under normal navigation
+// m.diffSHA / m.diffPath / m.activeHunk align with the file panel's
+// selection by the time the user presses `d`. Pressing `d` before the
+// auto-load completes falls into the no-hunks branch and yields the
+// status message.
+func (m *model) toggleRevertMarkFromFiles() tea.Cmd {
+	sha, path, ok := m.currentSelection()
+	if !ok {
+		return m.raiseStatus("No hunks to revert")
+	}
+	// The selected file in the files panel must match the loaded diff
+	// for activeHunk to be meaningful.
+	if m.diffSHA != sha || m.diffPath != path {
+		return m.raiseStatus("No hunks to revert")
+	}
+	return m.toggleRevertMark()
+}
+
+// seedFileIDs folds the rename relationships from one commit's
+// NumStat into m.fileIDs so every path the user has seen across loaded
+// history resolves to a stable FileID. Renames apply ApplyRename
+// (old → new); plain touches Resolve to allocate an ID if not seen yet.
+// Safe to call repeatedly with the same file list; the registry is
+// idempotent under re-touch and self-renames.
+func (m *model) seedFileIDs(files []gitcmd.FileStat) {
+	if m.fileIDs == nil {
+		m.fileIDs = fileid.New()
+	}
+	for _, f := range files {
+		if f.OldPath != "" && f.Path != "" && f.OldPath != f.Path {
+			m.fileIDs.ApplyRename(f.OldPath, f.Path)
+			continue
+		}
+		if f.Path != "" {
+			m.fileIDs.Resolve(f.Path)
+		}
+	}
+}
+
+// hunkTotalsKey returns the map key used by m.hunkTotals for a
+// (sha, path) pair.
+func hunkTotalsKey(sha, path string) string {
+	return sha + "\x00" + path
+}
+
+// commitFullyFlagged reports whether every hunk across every file of
+// the commit has been flagged for revert. Requires both the commit's
+// file list (cached on FilesResult) and a known hunk total for every
+// non-binary file (cached on DiffResult). When either is missing the
+// renderer falls back to `*` rather than auto-promoting to `D` — so
+// the user only sees `D` after they have visited every file in the
+// commit at least once. A commit with zero countable hunks (all binary
+// or pure-rename) never auto-promotes.
+func (m *model) commitFullyFlagged(sha string) bool {
+	files, ok := m.filesByCommit[sha]
+	if !ok || len(files) == 0 {
+		return false
+	}
+	total := 0
+	for _, f := range files {
+		if f.IsBinary {
+			continue
+		}
+		t, known := m.hunkTotals[hunkTotalsKey(sha, f.Path)]
+		if !known {
+			return false
+		}
+		total += t
+	}
+	if total == 0 {
+		return false
+	}
+	return m.reverts.MarksForCommit(sha) == total
+}
+
+// fileFullyFlagged reports whether every hunk of (sha, path) is
+// flagged for revert. Returns false when the file's hunk total is not
+// yet known (i.e. the user has not visited the diff for this file).
+func (m *model) fileFullyFlagged(sha, path string) bool {
+	total, known := m.hunkTotals[hunkTotalsKey(sha, path)]
+	if !known || total <= 0 {
+		return false
+	}
+	return m.reverts.CountForFile(sha, m.fileIDs.Resolve(path)) == total
+}
+
+// commitActionDisplay returns the action-column letter for a commit
+// row and whether the row should be rendered with the dropped-subject
+// styling (strikethrough + faint).
+//
+// Explicit user drops always win: a commit with ActionDrop pending
+// shows `D` and gets the dropped subject styling regardless of any
+// revert marks. Otherwise, a commit whose every hunk is flagged
+// auto-promotes to `D`; a commit with at least one (but not every)
+// hunk flagged shows `*` without the subject styling. A commit with
+// no marks returns ("", false).
+func (m *model) commitActionDisplay(sha string) (letter string, dropStyle bool) {
+	if kind, ok := m.pendingActions[sha]; ok && kind == ActionDrop {
+		return "D", true
+	}
+	if m.reverts.MarksForCommit(sha) == 0 {
+		return "", false
+	}
+	if m.commitFullyFlagged(sha) {
+		return "D", true
+	}
+	return "*", false
+}
+
+// hasAnyActionMarks reports whether the log view should reserve its
+// leading action column. True when any commit has a drop mark or any
+// revert mark exists in the session.
+func (m *model) hasAnyActionMarks() bool {
+	if len(m.pendingActions) > 0 {
+		return true
+	}
+	// Any revert mark forces the column. Walk the cached commits and
+	// check the per-commit counter rather than poking at revertstate
+	// internals.
+	for i := range m.commits {
+		if m.reverts.MarksForCommit(m.commits[i].SHA) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// startSave is the ctrl+s entry point. It enforces the slice-12
+// edge-case matrix:
+//
+//   - no marks anywhere → "Nothing to process"
+//   - cursor has no marks, no drops, but other commits carry revert
+//     marks → guide the user to navigate to one of those commits
+//   - cursor has no marks, drops exist → existing drop-only flow
+//   - cursor has revert marks (with or without drops) → unified
+//     RebaseEditStart pipeline. When every hunk on the cursor commit
+//     is flagged, the rebase auto-promotes to dropping the cursor
+//     entirely (no apply step).
+//
+// The full precondition battery (clean worktree, branch checked out
+// elsewhere, detached HEAD, stale marks) runs once for every routed
+// flow; failures open the refuse popup or raise a status message.
 func (m model) startSave() (tea.Model, tea.Cmd) {
-	if len(m.pendingActions) == 0 {
+	cursorSHA := ""
+	if m.selectedIdx >= 0 && m.selectedIdx < len(m.commits) {
+		cursorSHA = m.commits[m.selectedIdx].SHA
+	}
+	cursorReverts := 0
+	if cursorSHA != "" {
+		cursorReverts = m.reverts.MarksForCommit(cursorSHA)
+	}
+	if cursorReverts == 0 && len(m.pendingActions) == 0 {
+		if m.hasAnyRevertMarks() {
+			return m, m.raiseStatus("Navigate to a commit with revert marks to process them")
+		}
 		return m, m.raiseStatus("No pending actions")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1270,7 +1637,68 @@ func (m model) startSave() (tea.Model, tea.Cmd) {
 		m.rebaseState = rebaseStateRefuse
 		return m, nil
 	}
-	// Stale-mark check: every marked SHA must still resolve.
+	if cursorReverts > 0 {
+		// Combined or revert-only flow: validate cursor + every drop.
+		ok, err := m.git.CommitExists(ctx, cursorSHA)
+		if err != nil {
+			return m, m.raiseError(err)
+		}
+		if !ok {
+			m.rebaseRefuseMsg = "Cursor commit no longer exists — refresh first"
+			m.rebaseState = rebaseStateRefuse
+			return m, nil
+		}
+		missing := 0
+		drops := make([]string, 0, len(m.pendingActions))
+		for sha, kind := range m.pendingActions {
+			if kind != ActionDrop {
+				continue
+			}
+			if sha == cursorSHA {
+				// Defensive: an explicit drop on the cursor would race
+				// with auto-promote. Skip it here; the cursor is handled
+				// by the revert pipeline.
+				continue
+			}
+			drops = append(drops, sha)
+			exists, err := m.git.CommitExists(ctx, sha)
+			if err != nil {
+				return m, m.raiseError(err)
+			}
+			if !exists {
+				missing++
+			}
+		}
+		if missing > 0 {
+			m.rebaseRefuseMsg = fmt.Sprintf("%d marked commit%s no longer exist — refresh first",
+				missing, plural2(missing))
+			m.rebaseState = rebaseStateRefuse
+			return m, nil
+		}
+		autoPromote := m.commitFullyFlagged(cursorSHA)
+		var patches map[string]string
+		count := 0
+		if !autoPromote {
+			patches, count, err = m.buildRevertPatchesForCommit(ctx, cursorSHA)
+			if err != nil {
+				return m, m.raiseError(err)
+			}
+			if count == 0 {
+				return m, m.raiseStatus("No revertable hunks on cursor commit")
+			}
+		} else {
+			count = m.reverts.MarksForCommit(cursorSHA)
+		}
+		m.rebaseFlow = rebaseFlowRevert
+		m.rebaseRevertCursorSHA = cursorSHA
+		m.rebaseRevertPatches = patches
+		m.rebaseRevertCount = count
+		m.rebaseRevertDrops = drops
+		m.rebaseRevertAutoPromote = autoPromote
+		m.rebaseState = rebaseStateSummary
+		return m, nil
+	}
+	// Drop-only flow: stale-check every marked SHA.
 	missing := 0
 	for sha := range m.pendingActions {
 		ok, err := m.git.CommitExists(ctx, sha)
@@ -1287,8 +1715,90 @@ func (m model) startSave() (tea.Model, tea.Cmd) {
 		m.rebaseState = rebaseStateRefuse
 		return m, nil
 	}
+	m.rebaseFlow = rebaseFlowDrop
 	m.rebaseState = rebaseStateSummary
 	return m, nil
+}
+
+// hasAnyRevertMarks reports whether any commit in the loaded log
+// currently carries at least one revert mark. Used by startSave to
+// distinguish "nothing to do" from "marks exist but you're not on a
+// commit that has them".
+func (m *model) hasAnyRevertMarks() bool {
+	for i := range m.commits {
+		if m.reverts.MarksForCommit(m.commits[i].SHA) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildRevertPatchesForCommit produces the per-file reverse-patch map
+// for every file with revert marks on sha. Each file's marked hunks are
+// extracted from a fresh default-context diff (so canonical hunk text
+// matches what `git apply -R --3way` will operate on at the edit halt)
+// and combined into a single per-file patch. For renamed files the
+// patch carries `rename from`/`rename to` headers so the reverse apply
+// undoes both the rename and the flagged content, per PRD story 24.
+// Returns the patch map and the total hunk count. A file whose ExtractByIndex
+// returns "" for every index — i.e. every marked index is now out of range —
+// contributes nothing and is omitted; the count reflects only hunks that
+// will actually be applied.
+func (m *model) buildRevertPatchesForCommit(ctx context.Context, sha string) (map[string]string, int, error) {
+	patches := map[string]string{}
+	total := 0
+	for _, f := range m.filesByCommit[sha] {
+		if f.IsBinary {
+			continue
+		}
+		id := m.fileIDs.Resolve(f.Path)
+		idxs := m.reverts.MarksForFile(sha, id)
+		if len(idxs) == 0 {
+			continue
+		}
+		diff, err := m.git.DiffHunks(ctx, sha, f.Path)
+		if err != nil {
+			return nil, 0, err
+		}
+		hunks := make([]string, 0, len(idxs))
+		for _, idx := range idxs {
+			h := hunkpatch.ExtractByIndex(diff, idx)
+			if h == "" {
+				continue
+			}
+			hunks = append(hunks, h)
+		}
+		if len(hunks) == 0 {
+			continue
+		}
+		patches[f.Path] = buildPerFilePatch(f, hunks)
+		total += len(hunks)
+	}
+	return patches, total, nil
+}
+
+// buildPerFilePatch assembles the reverse patch for one file. For a
+// non-renamed file it delegates to hunkpatch.CombineForFile. For a
+// renamed file it synthesises a header carrying both the rename and
+// the hunks so `git apply -R` undoes them together.
+func buildPerFilePatch(f gitcmd.FileStat, hunks []string) string {
+	if len(hunks) == 0 {
+		return ""
+	}
+	if f.OldPath == "" || f.OldPath == f.Path {
+		return hunkpatch.CombineForFile(f.Path, hunks)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/%s b/%s\n", f.OldPath, f.Path)
+	fmt.Fprintf(&b, "rename from %s\n", f.OldPath)
+	fmt.Fprintf(&b, "rename to %s\n", f.Path)
+	fmt.Fprintf(&b, "--- a/%s\n", f.OldPath)
+	fmt.Fprintf(&b, "+++ b/%s\n", f.Path)
+	for _, h := range hunks {
+		b.WriteString(strings.TrimRight(h, "\n"))
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // plural2 returns "" for n==1 and "s" otherwise. Used for messages like
@@ -1313,6 +1823,12 @@ func (m model) updateRebasePopup(keyStr string) (tea.Model, tea.Cmd) {
 		case "esc", "q", "enter":
 			m.rebaseState = rebaseStateIdle
 			m.rebaseRefuseMsg = ""
+			m.rebaseFlow = rebaseFlowNone
+			m.rebaseRevertCursorSHA = ""
+			m.rebaseRevertPatches = nil
+			m.rebaseRevertCount = 0
+			m.rebaseRevertDrops = nil
+			m.rebaseRevertAutoPromote = false
 			return m, nil
 		}
 		return m, nil
@@ -1322,6 +1838,12 @@ func (m model) updateRebasePopup(keyStr string) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "esc", "q":
 			m.rebaseState = rebaseStateIdle
+			m.rebaseFlow = rebaseFlowNone
+			m.rebaseRevertCursorSHA = ""
+			m.rebaseRevertPatches = nil
+			m.rebaseRevertCount = 0
+			m.rebaseRevertDrops = nil
+			m.rebaseRevertAutoPromote = false
 			return m, nil
 		case "enter":
 			return m.confirmRebase()
@@ -1342,7 +1864,7 @@ func (m model) updateRebasePopup(keyStr string) (tea.Model, tea.Cmd) {
 		switch keyStr {
 		case "ctrl+c":
 			return m, tea.Quit
-		case "a":
+		case "a", "esc":
 			return m.conflictAbort()
 		case "t":
 			return m.conflictResolveSide(gitcmd.SideTheirs)
@@ -1400,6 +1922,11 @@ func (m model) manualWaitOK() (tea.Model, tea.Cmd) {
 	m.rebaseState = rebaseStateRunning
 	ctx, cancelRun := context.WithCancel(context.Background())
 	m.rebaseCancel = cancelRun
+	if m.rebaseFlow == rebaseFlowRevert {
+		atApply := m.rebaseRevertAtApply
+		m.rebaseRevertAtApply = false
+		return m, m.runRebaseRevertResumeCmd(ctx, gitcmd.SideTheirs, nil, atApply)
+	}
 	return m, m.runRebaseContinueAfterManualCmd(ctx)
 }
 
@@ -1420,7 +1947,10 @@ func (m model) runRebaseContinueAfterManualCmd(ctx context.Context) tea.Cmd {
 
 // conflictAbort handles the [a] button on the conflict popup: runs
 // `git rebase --abort`, preserves the mark set, and surfaces a status
-// message confirming the repo is back to its pre-rebase state.
+// message confirming the repo is back to its pre-rebase state. For the
+// revert flow the pre-`ctrl-s` snapshot of revert marks is restored
+// (including the cursor commit's marks that the rebase would have
+// processed) so cancellation is fully non-destructive.
 func (m model) conflictAbort() (tea.Model, tea.Cmd) {
 	abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1428,21 +1958,41 @@ func (m model) conflictAbort() (tea.Model, tea.Cmd) {
 	m.rebaseState = rebaseStateIdle
 	m.rebaseHalt = gitcmd.RebaseResult{}
 	m.rebaseManualUnmerged = nil
-	m.rebaseSnapshot = nil
 	m.rebaseAnchorSHA = ""
+	if m.rebaseFlow == rebaseFlowRevert {
+		m.reverts.Restore(m.rebaseRevertSnapshot)
+		m.rebaseRevertSnapshot = revertstate.Snapshot{}
+		m.rebaseRevertCursorSHA = ""
+		m.rebaseRevertPatches = nil
+		m.rebaseRevertCount = 0
+		m.rebaseRevertDrops = nil
+		m.rebaseRevertAutoPromote = false
+		m.rebaseRevertAtApply = false
+		m.rebaseFlow = rebaseFlowNone
+		return m, m.raiseStatus("Rebase cancelled — no changes made")
+	}
+	m.rebaseSnapshot = nil
+	m.rebaseFlow = rebaseFlowNone
 	return m, m.raiseStatus("Drop cancelled — repo unchanged")
 }
 
 // conflictResolveSide handles [t] / [o] on the conflict popup: stages
-// every conflicted path to the chosen side and kicks off `git rebase
-// --continue`. The blocking modal returns until the next halt or
-// completion.
+// every conflicted path to the chosen side and kicks off the
+// appropriate continuation. For the drop flow that's just
+// CheckoutSide + RebaseContinue; for the revert flow at an apply-step
+// halt the worktree resolution still needs AmendNoEdit before
+// `git rebase --continue` (cascade halts behave like the drop flow).
 func (m model) conflictResolveSide(side gitcmd.ConflictSide) (tea.Model, tea.Cmd) {
 	paths := append([]string(nil), m.rebaseHalt.ConflictedPaths...)
 	m.rebaseHalt = gitcmd.RebaseResult{}
 	m.rebaseState = rebaseStateRunning
 	ctx, cancel := context.WithCancel(context.Background())
 	m.rebaseCancel = cancel
+	if m.rebaseFlow == rebaseFlowRevert {
+		atApply := m.rebaseRevertAtApply
+		m.rebaseRevertAtApply = false
+		return m, m.runRebaseRevertResumeCmd(ctx, side, paths, atApply)
+	}
 	return m, m.runRebaseContinueCmd(ctx, side, paths)
 }
 
@@ -1473,6 +2023,9 @@ func (m model) runRebaseContinueCmd(ctx context.Context, side gitcmd.ConflictSid
 // range), transitions to the blocking modal, and launches the rebase
 // goroutine.
 func (m model) confirmRebase() (tea.Model, tea.Cmd) {
+	if m.rebaseFlow == rebaseFlowRevert {
+		return m.confirmRevertRebase()
+	}
 	snapshot := make([]string, 0, len(m.pendingActions))
 	for sha := range m.pendingActions {
 		snapshot = append(snapshot, sha)
@@ -1512,6 +2065,445 @@ func (m model) runRebaseCmd(ctx context.Context, marked []string) tea.Cmd {
 	}
 }
 
+// confirmRevertRebase snapshots the revert tracker, computes the
+// post-success cursor anchor, and launches the revert pipeline. The
+// anchor is the cursor commit's parent (next row down in the log) so
+// the post-rebase refresh can land the cursor on a SHA that survived
+// the rebase. If no older commit is loaded the anchor is left empty
+// and the cursor falls back to the top of the refreshed log.
+func (m model) confirmRevertRebase() (tea.Model, tea.Cmd) {
+	m.rebaseRevertSnapshot = m.reverts.Snapshot()
+	anchor := ""
+	for i := m.selectedIdx + 1; i < len(m.commits); i++ {
+		sha := m.commits[i].SHA
+		if _, dropped := m.pendingActions[sha]; dropped {
+			continue
+		}
+		anchor = sha
+		break
+	}
+	m.rebaseAnchorSHA = anchor
+	m.rebaseState = rebaseStateRunning
+	ctx, cancel := context.WithCancel(context.Background())
+	m.rebaseCancel = cancel
+	return m, m.runRebaseRevertCmd(
+		ctx,
+		m.rebaseRevertCursorSHA,
+		m.rebaseRevertPatches,
+		m.rebaseRevertDrops,
+		m.rebaseRevertAutoPromote,
+	)
+}
+
+// runRebaseRevertCmd drives the unified revert pipeline. The normal
+// path runs RebaseEditStart → ApplyReverse3Way → AmendNoEdit →
+// RebaseContinue; auto-promote skips straight from RebaseEditStart
+// (cursor todo entry is `drop`) to RebaseContinue's RebaseDone — no
+// apply / amend step. A halt at any stage posts a `halted` message;
+// handleRevertDone opens the conflict popup. Resumption re-enters
+// via runRebaseRevertResumeCmd.
+func (m model) runRebaseRevertCmd(ctx context.Context, cursorSHA string, patches map[string]string, drops []string, autoPromote bool) tea.Cmd {
+	git := m.git
+	cursorSubj := ""
+	for _, c := range m.commits {
+		if c.SHA == cursorSHA {
+			cursorSubj = c.Subject
+			break
+		}
+	}
+	return func() tea.Msg {
+		res, err := git.RebaseEditStart(ctx, cursorSHA, drops, autoPromote)
+		if ctx.Err() != nil {
+			return revertDoneMsg{cancelled: true, midRebase: true}
+		}
+		if err != nil {
+			return revertDoneMsg{err: err}
+		}
+		switch res.State {
+		case gitcmd.RebaseDone:
+			// Auto-promote completes here without an edit halt; the
+			// drop-only sub-case (no reverts at all) is routed
+			// elsewhere, so this branch is the expected success path
+			// when autoPromote is true.
+			return revertDoneMsg{done: true}
+		case gitcmd.RebaseEditHalt:
+			if autoPromote {
+				// Defensive: should not happen — auto-promote substitutes
+				// drop, so no edit halt is expected. Abort.
+				return revertDoneMsg{err: errors.New("unexpected edit halt during auto-promote"), midRebase: true}
+			}
+			// fall through to apply
+		case gitcmd.RebaseHalted:
+			return revertDoneMsg{halted: true, midRebase: true, conflicted: res.ConflictedPaths, haltSHA: res.HaltSHA, haltSubj: res.HaltSubject, stderr: res.Stderr}
+		default:
+			return revertDoneMsg{stderr: res.Stderr, err: errors.New("rebase failed before edit halt")}
+		}
+		unmerged, err := git.ApplyReverse3Way(ctx, patches)
+		if ctx.Err() != nil {
+			return revertDoneMsg{cancelled: true, midRebase: true}
+		}
+		if err != nil {
+			return revertDoneMsg{err: err, midRebase: true}
+		}
+		if len(unmerged) > 0 {
+			return revertDoneMsg{halted: true, atApply: true, midRebase: true, conflicted: unmerged, haltSHA: cursorSHA, haltSubj: cursorSubj}
+		}
+		if err := git.AmendNoEdit(ctx); err != nil {
+			if ctx.Err() != nil {
+				return revertDoneMsg{cancelled: true, midRebase: true}
+			}
+			return revertDoneMsg{err: err, midRebase: true}
+		}
+		res, err = git.RebaseContinue(ctx)
+		if ctx.Err() != nil {
+			return revertDoneMsg{cancelled: true, midRebase: true}
+		}
+		if err != nil {
+			return revertDoneMsg{err: err, midRebase: true}
+		}
+		switch res.State {
+		case gitcmd.RebaseDone:
+			return revertDoneMsg{done: true}
+		case gitcmd.RebaseHalted:
+			return revertDoneMsg{halted: true, midRebase: true, conflicted: res.ConflictedPaths, haltSHA: res.HaltSHA, haltSubj: res.HaltSubject, stderr: res.Stderr}
+		default:
+			return revertDoneMsg{stderr: res.Stderr, err: errors.New("rebase failed during continue"), midRebase: true}
+		}
+	}
+}
+
+// runRebaseRevertResumeCmd resumes the revert pipeline after a conflict
+// popup resolution. Steps (each skipped when not applicable):
+//
+//   - stage `paths` to `side` (bulk [t]/[o] resolve). For manual
+//     resolve, paths is empty and CheckoutSide is skipped — the user
+//     has already staged their resolution.
+//   - if atApply: AmendNoEdit folds the now-resolved worktree into
+//     the cursor commit.
+//   - RebaseContinue advances the rebase. A further halt produces
+//     another `halted` revertDoneMsg (always with atApply=false, since
+//     subsequent halts are cascade halts on downstream commits).
+func (m model) runRebaseRevertResumeCmd(ctx context.Context, side gitcmd.ConflictSide, paths []string, atApply bool) tea.Cmd {
+	git := m.git
+	return func() tea.Msg {
+		if len(paths) > 0 {
+			if err := git.CheckoutSide(ctx, side, paths); err != nil {
+				if ctx.Err() != nil {
+					return revertDoneMsg{cancelled: true, midRebase: true}
+				}
+				return revertDoneMsg{err: err, midRebase: true}
+			}
+		}
+		if atApply {
+			if err := git.AmendNoEdit(ctx); err != nil {
+				if ctx.Err() != nil {
+					return revertDoneMsg{cancelled: true, midRebase: true}
+				}
+				return revertDoneMsg{err: err, midRebase: true}
+			}
+		}
+		res, err := git.RebaseContinue(ctx)
+		if ctx.Err() != nil {
+			return revertDoneMsg{cancelled: true, midRebase: true}
+		}
+		if err != nil {
+			return revertDoneMsg{err: err, midRebase: true}
+		}
+		switch res.State {
+		case gitcmd.RebaseDone:
+			return revertDoneMsg{done: true}
+		case gitcmd.RebaseHalted:
+			return revertDoneMsg{halted: true, midRebase: true, conflicted: res.ConflictedPaths, haltSHA: res.HaltSHA, haltSubj: res.HaltSubject, stderr: res.Stderr}
+		default:
+			return revertDoneMsg{stderr: res.Stderr, err: errors.New("rebase failed during continue"), midRebase: true}
+		}
+	}
+}
+
+// handleRevertDone routes the revert pipeline's outcome. A halt opens
+// the conflict popup with the unmerged paths and the apply-vs-cascade
+// flag the resume path needs; cancel/err aborts the mid-rebase state
+// and restores the snapshot; done clears the cursor commit's marks
+// and refreshes the log onto the anchor. Adoption of marks on
+// rewritten descendant SHAs lands in slice 13.
+func (m model) handleRevertDone(msg revertDoneMsg) (tea.Model, tea.Cmd) {
+	if m.rebaseCancel != nil {
+		m.rebaseCancel()
+		m.rebaseCancel = nil
+	}
+	m.rebaseManualUnmerged = nil
+
+	cursorSHA := m.rebaseRevertCursorSHA
+	count := m.rebaseRevertCount
+	drops := m.rebaseRevertDrops
+	autoPromote := m.rebaseRevertAutoPromote
+
+	if msg.halted {
+		m.rebaseHalt = gitcmd.RebaseResult{
+			State:           gitcmd.RebaseHalted,
+			HaltSHA:         msg.haltSHA,
+			HaltSubject:     msg.haltSubj,
+			ConflictedPaths: msg.conflicted,
+			Stderr:          msg.stderr,
+		}
+		m.rebaseRevertAtApply = msg.atApply
+		m.rebaseState = rebaseStateConflict
+		return m, nil
+	}
+
+	m.rebaseState = rebaseStateIdle
+	m.rebaseHalt = gitcmd.RebaseResult{}
+	m.rebaseRevertAtApply = false
+
+	if !msg.done {
+		if msg.midRebase {
+			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = m.git.RebaseAbort(abortCtx)
+		}
+		m.reverts.Restore(m.rebaseRevertSnapshot)
+		m.rebaseRevertSnapshot = revertstate.Snapshot{}
+		m.rebaseRevertCursorSHA = ""
+		m.rebaseRevertPatches = nil
+		m.rebaseRevertCount = 0
+		m.rebaseRevertDrops = nil
+		m.rebaseRevertAutoPromote = false
+		m.rebaseAnchorSHA = ""
+		m.rebaseFlow = rebaseFlowNone
+		switch {
+		case msg.cancelled:
+			return m, m.raiseStatus("Rebase cancelled — no changes made")
+		case msg.err != nil:
+			return m, m.raiseError(fmt.Errorf("Revert failed: %s", msg.err.Error()))
+		default:
+			summary := summariseStderr(msg.stderr)
+			if summary == "" {
+				summary = "unknown rebase error"
+			}
+			return m, m.raiseError(fmt.Errorf("Revert failed: %s", summary))
+		}
+	}
+
+	// Success: clear the cursor commit's revert marks (already processed
+	// by the rebase) and every drop commit's marks (the commit is gone,
+	// so the marks have no home). Marks remaining after this clearing
+	// belong to ancestors or descendants of the rebase range and need
+	// to be re-attached to the new history by content match. Build the
+	// adoption multiset from the remaining marks, then reset the
+	// tracker — every surviving mark will be re-installed by the
+	// post-refresh walk in handleAdoptionDone, keyed by the new SHA.
+	m.reverts.ClearSHA(cursorSHA)
+	for _, sha := range drops {
+		delete(m.pendingActions, sha)
+		m.reverts.ClearSHA(sha)
+	}
+	adoptionTable := m.reverts.BuildAdoptionTable()
+	adoptionTotal := 0
+	adoptionWanted := map[string]struct{}{}
+	for k, n := range adoptionTable {
+		adoptionTotal += n
+		adoptionWanted[k.HunkHash] = struct{}{}
+	}
+	// Reset the tracker even when the table is empty: any leftover mark
+	// without a hash is unadoptable and otherwise becomes ghost state
+	// keyed by a stale SHA.
+	m.reverts = revertstate.New()
+	if adoptionTotal > 0 {
+		m.adoptionTable = adoptionTable
+		m.adoptionTotal = adoptionTotal
+		m.adoptionWanted = adoptionWanted
+	} else {
+		m.adoptionTable = nil
+		m.adoptionTotal = 0
+		m.adoptionWanted = nil
+	}
+	m.rebaseRevertSnapshot = revertstate.Snapshot{}
+	m.rebaseRevertCursorSHA = ""
+	m.rebaseRevertPatches = nil
+	m.rebaseRevertCount = 0
+	m.rebaseRevertDrops = nil
+	m.rebaseRevertAutoPromote = false
+	m.rebaseFlow = rebaseFlowNone
+	anchor := m.rebaseAnchorSHA
+	m.rebaseAnchorSHA = ""
+
+	ldr := m.ldr
+	if ldr != nil {
+		ldr.CancelDetail()
+		ldr.CancelNumStat()
+		ldr.CancelDiff()
+	}
+	m.pendingRefreshSHA = anchor
+	m.pendingRefreshPath = ""
+	m.ldr = loader.New(loader.Config{Source: m.git})
+	m.commits = nil
+	m.selectedIdx = 0
+	m.viewportTop = 0
+	m.loadedAll = false
+	m.loadingMore = false
+	m.detail = gitcmd.CommitDetail{}
+	m.detailSHA = ""
+	m.msgScroll = 0
+	m.files = nil
+	m.filesSHA = ""
+	m.filesSelectedIdx = 0
+	m.filesViewportTop = 0
+	m.diff = diffrender.Result{}
+	m.diffSHA = ""
+	m.diffPath = ""
+	m.diffScroll = 0
+	m.diffHScroll = 0
+	m.activeHunk = hunkstate.NoActiveHunk
+	m.hunks = hunkstate.New()
+	m.detailLoading = false
+	m.filesLoading = false
+	m.diffLoading = false
+	m.resetBinarySize()
+	short := cursorSHA
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	dropCount := len(drops)
+	if autoPromote {
+		// In the auto-promote path the cursor was processed as a drop;
+		// roll it into the drop count for the user-facing message and
+		// suppress the "Reverted N hunks" half (the user marked all
+		// the hunks but the rebase didn't actually run apply step).
+		dropCount++
+	}
+	var flash string
+	switch {
+	case autoPromote:
+		flash = fmt.Sprintf("Dropped %d commit%s", dropCount, plural2(dropCount))
+	case dropCount > 0:
+		flash = fmt.Sprintf("Reverted %d hunk%s in %s, dropped %d commit%s",
+			count, plural2(count), short, dropCount, plural2(dropCount))
+	default:
+		flash = fmt.Sprintf("Reverted %d hunk%s in %s", count, plural2(count), short)
+	}
+	return m, tea.Batch(m.loadLogCmd(0), m.raiseStatus(flash))
+}
+
+// maybeStartAdoptionWalk dispatches the post-rebase adoption walk
+// when handleRevertDone has staged an adoption table. Returns nil
+// when there is nothing to adopt (no marks survived clearing, or
+// the table was already consumed by an earlier walk).
+func (m *model) maybeStartAdoptionWalk() tea.Cmd {
+	if m.adoptionTable == nil || m.adoptionTotal == 0 || len(m.commits) == 0 {
+		return nil
+	}
+	shas := make([]string, len(m.commits))
+	for i, c := range m.commits {
+		shas[i] = c.SHA
+	}
+	return m.runAdoptionWalkCmd(shas, m.adoptionWanted)
+}
+
+// flushAdoptionAsDiscards posts an empty walk result to drive the
+// discard-counting path without making any git calls. Used when the
+// post-rebase log refresh returns no commits at all, so no candidate
+// can possibly adopt.
+func (m *model) flushAdoptionAsDiscards() tea.Cmd {
+	return func() tea.Msg {
+		return adoptionDoneMsg{commits: nil}
+	}
+}
+
+// runAdoptionWalkCmd walks the loaded post-rebase commit range
+// (chronologically, oldest → newest) and gathers every hunk whose
+// canonical hash appears in `wanted`. NumStat per commit also yields
+// the rename events the main thread needs to update its fileid
+// registry before the candidates are adopted. The walk is purely
+// read-only: it makes no mark insertions itself and does not touch
+// the registry — adoption is finalised in handleAdoptionDone with
+// access to the model's shared state.
+func (m model) runAdoptionWalkCmd(shas []string, wanted map[string]struct{}) tea.Cmd {
+	git := m.git
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		out := make([]adoptionCommitData, 0, len(shas))
+		// shas comes in newest-first (the log order); reverse-iterate so
+		// the main thread sees commits oldest-first, matching the
+		// multiset-decrement walk described in the PRD.
+		for i := len(shas) - 1; i >= 0; i-- {
+			sha := shas[i]
+			files, err := git.NumStat(ctx, sha)
+			if err != nil {
+				continue
+			}
+			cd := adoptionCommitData{sha: sha, files: files}
+			for _, f := range files {
+				if f.Path == "" || f.IsBinary {
+					continue
+				}
+				diff, err := git.DiffHunks(ctx, sha, f.Path)
+				if err != nil || diff == "" {
+					continue
+				}
+				for idx := 0; ; idx++ {
+					hunk := hunkpatch.ExtractByIndex(diff, idx)
+					if hunk == "" {
+						break
+					}
+					h := hunkpatch.Hash(hunkpatch.Canonical(hunk))
+					if _, want := wanted[h]; !want {
+						continue
+					}
+					cd.candidates = append(cd.candidates, adoptionCandidate{
+						path: f.Path,
+						idx:  idx,
+						hash: h,
+					})
+				}
+			}
+			out = append(out, cd)
+		}
+		return adoptionDoneMsg{commits: out}
+	}
+}
+
+// handleAdoptionDone consumes the walk's output: it replays each
+// commit's rename events onto m.fileIDs (so the registry's view of
+// the new history matches what the user sees), then attempts to
+// adopt each candidate against the saved table. Adoption decrements
+// the table's count for that (FileID, HunkHash); when no count
+// remains the candidate is silently discarded. The walk preserves
+// the multiset semantics required by the PRD: identical hunks in
+// different files don't cross-adopt (different FileIDs), and a hunk
+// repeated N times adopts up to N times.
+//
+// After the walk, any leftover counts in the table are discards:
+// marks that had no home in the new history. The post-rebase status
+// flash is supplemented with a discard-count line when that count
+// is nonzero so the user knows work was lost.
+func (m model) handleAdoptionDone(msg adoptionDoneMsg) (tea.Model, tea.Cmd) {
+	table := m.adoptionTable
+	total := m.adoptionTotal
+	m.adoptionTable = nil
+	m.adoptionTotal = 0
+	m.adoptionWanted = nil
+	if table == nil || total == 0 {
+		return m, nil
+	}
+	adopted := 0
+	for _, cd := range msg.commits {
+		m.seedFileIDs(cd.files)
+		for _, cand := range cd.candidates {
+			fid := m.fileIDs.Resolve(cand.path)
+			if m.reverts.Adopt(table, cd.sha, fid, cand.idx, cand.hash) {
+				adopted++
+			}
+		}
+	}
+	discards := total - adopted
+	if discards <= 0 {
+		return m, nil
+	}
+	return m, m.raiseStatus(fmt.Sprintf(
+		"%d mark%s discarded due to history changes", discards, plural2(discards)))
+}
+
 // handleRebaseDone routes the rebase outcome: success clears marks
 // and refreshes the log with the cursor restored to the anchor SHA;
 // failure / halt / cancellation runs `git rebase --abort` (idempotent),
@@ -1530,6 +2522,7 @@ func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
 		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = m.git.RebaseAbort(abortCtx)
+		m.rebaseFlow = rebaseFlowNone
 		return m, m.raiseStatus("Drop cancelled — repo unchanged")
 	}
 	// Unexpected gitcmd-level failure (e.g. cannot fork sed). Auto-
@@ -1538,6 +2531,7 @@ func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
 		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = m.git.RebaseAbort(abortCtx)
+		m.rebaseFlow = rebaseFlowNone
 		return m, m.raiseError(msg.err)
 	}
 	switch msg.result.State {
@@ -1583,6 +2577,7 @@ func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
 		m.filesLoading = false
 		m.diffLoading = false
 		m.resetBinarySize()
+		m.rebaseFlow = rebaseFlowNone
 		flash := fmt.Sprintf("Dropped %d commit%s", dropped, plural2(dropped))
 		return m, tea.Batch(m.loadLogCmd(0), m.raiseStatus(flash))
 	case gitcmd.RebaseHalted:
@@ -1597,6 +2592,7 @@ func (m model) handleRebaseDone(msg rebaseDoneMsg) (tea.Model, tea.Cmd) {
 		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = m.git.RebaseAbort(abortCtx)
+		m.rebaseFlow = rebaseFlowNone
 		summary := summariseStderr(msg.result.Stderr)
 		if summary == "" {
 			summary = "unknown rebase error"
@@ -1964,6 +2960,11 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	// Pending action marks belong to a specific repository state. Switching
 	// worktrees discards them entirely.
 	m.pendingActions = map[string]ActionKind{}
+	m.reverts = revertstate.New()
+	m.fileIDs = fileid.New()
+	m.diffHunks = ""
+	m.hunkTotals = map[string]int{}
+	m.filesByCommit = map[string][]gitcmd.FileStat{}
 	if m.rebaseCancel != nil {
 		m.rebaseCancel()
 		m.rebaseCancel = nil
@@ -1974,6 +2975,17 @@ func (m model) switchWorktree(path string) (tea.Model, tea.Cmd) {
 	m.rebaseAnchorSHA = ""
 	m.rebaseHalt = gitcmd.RebaseResult{}
 	m.rebaseManualUnmerged = nil
+	m.rebaseFlow = rebaseFlowNone
+	m.rebaseRevertSnapshot = revertstate.Snapshot{}
+	m.rebaseRevertCursorSHA = ""
+	m.rebaseRevertPatches = nil
+	m.rebaseRevertCount = 0
+	m.rebaseRevertDrops = nil
+	m.rebaseRevertAutoPromote = false
+	m.rebaseRevertAtApply = false
+	m.adoptionTable = nil
+	m.adoptionTotal = 0
+	m.adoptionWanted = nil
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2352,10 +3364,10 @@ func (m *model) pageDiff(delta int) {
 	m.scrollDiff(delta * page)
 }
 
-// jumpDiffBottom scrolls so the final diff line sits at the bottom of
+// jumpDiffBottom scrolls so the final diff row sits at the bottom of
 // the visible body.
 func (m *model) jumpDiffBottom() {
-	m.diffScroll = len(m.diff.Lines)
+	m.diffScroll = m.diff.RowCount()
 	m.clampDiffScroll()
 }
 
@@ -2380,10 +3392,12 @@ func (m *model) advanceActiveHunk(dir int) {
 // viewport. When the hunk fits, the remaining viewport rows are split 30/70
 // between context above and below the hunk (floored, with the rounding
 // remainder falling into the "after" share). When the hunk is taller than
-// the viewport, its first line is pinned to the top so the `@@` header
-// stays visible. No-op when there is no active hunk.
+// the viewport, its first row is pinned to the top so the `@@` header
+// stays visible. No-op when there is no active hunk or when the active
+// hunk has no visible rows (a flagged pure-Add hunk under the issue-15
+// row model).
 func (m *model) scrollToActiveHunk() {
-	first, last, ok := m.diff.HunkRange(m.activeHunk)
+	first, last, ok := m.diff.HunkVisibleRange(m.activeHunk)
 	if !ok {
 		return
 	}
@@ -2398,13 +3412,13 @@ func (m *model) scrollToActiveHunk() {
 	m.clampDiffScroll()
 }
 
-// clampDiffScroll constrains diffScroll to [0, max(0, len(Lines)-bodyH)].
+// clampDiffScroll constrains diffScroll to [0, max(0, RowCount-bodyH)].
 func (m *model) clampDiffScroll() {
 	if m.diffScroll < 0 {
 		m.diffScroll = 0
 	}
 	bodyH := m.diffPanelBodyHeight()
-	max := len(m.diff.Lines) - bodyH
+	max := m.diff.RowCount() - bodyH
 	if max < 0 {
 		max = 0
 	}
@@ -2767,9 +3781,17 @@ var (
 
 	// droppedActionStyle renders the `D` letter in the leftmost action
 	// column for commits marked for drop. droppedSubjectStyle is composed
-	// over the subject text on the same rows.
+	// over the subject text on the same rows. revertActionStyle paints
+	// the `*` letter for commits with at least one (but not every) hunk
+	// flagged for revert — distinct from drop so the user can tell at a
+	// glance whether the row will be dropped or partially reverted.
 	droppedActionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
 	droppedSubjectStyle = lipgloss.NewStyle().Strikethrough(true).Faint(true)
+	revertActionStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("179")).Bold(true)
+	// dimmedFileStyle dims a file-list row whose every hunk is flagged
+	// for revert (slice 08): the whole file will be reverted when the
+	// commit is processed, so the row visually recedes.
+	dimmedFileStyle = lipgloss.NewStyle().Faint(true)
 
 	// commitDimStyle renders a non-selected commit row
 	// in a uniformly dim color when the active file filter excludes all
@@ -3030,10 +4052,12 @@ func fitRefs(refs []string, max int) (styled, plain string) {
 // space; restStyled carries colors, restPlain is identical character
 // content with no escapes (used as the basis for the selection
 // highlight). hasPendingColumn reserves a leading 3-cell action column
-// (1-cell letter + 2-space gap); marked applies strikethrough+dim to
-// the subject portion of restStyled (the plain version is unchanged so
-// row-level highlights remain solid).
-func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, marked bool) (short, date, author, restStyled, restPlain string, ok bool) {
+// (1-cell letter + 2-space gap); dropStyle applies strikethrough+dim
+// to the subject portion of restStyled (the plain version is unchanged
+// so row-level highlights remain solid). dropStyle is true for `D`
+// (explicit or auto-promoted) and false for `*` (partial revert) so
+// partially-marked rows keep readable subjects.
+func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, dropStyle bool) (short, date, author, restStyled, restPlain string, ok bool) {
 	const shaW, dateW, authorW = 7, 14, 16
 	const gap = "  "
 	const actionColW = 3 // 1-cell letter + 2-space gap
@@ -3059,7 +4083,7 @@ func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, marked bool)
 	if rw == 0 {
 		subj := padOrTruncate(c.Subject, restW)
 		styled := subj
-		if marked {
+		if dropStyle {
 			styled = droppedSubjectStyle.Render(subj)
 		}
 		return short, date, author, styled, subj, true
@@ -3076,7 +4100,7 @@ func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, marked bool)
 	subjW := restW - rw - 1
 	subj := padOrTruncate(c.Subject, subjW)
 	subjStyled := subj
-	if marked {
+	if dropStyle {
 		subjStyled = droppedSubjectStyle.Render(subj)
 	}
 	restStyled = refsStyled + " " + subjStyled
@@ -3087,19 +4111,23 @@ func commitRowColumns(c gitcmd.Commit, width int, hasPendingColumn, marked bool)
 // renderLogRow formats one commit row to exactly `width` cells with
 // per-column foreground colors (used for non-selected rows). When
 // hasPendingColumn is true the row reserves a leading 3-cell action
-// column (1-cell letter + 2-space gap); marked toggles the action
-// letter to a red-bold `D` and the subject to strikethrough+dim.
-func renderLogRow(c gitcmd.Commit, width int, hasPendingColumn, marked bool) string {
+// column (1-cell letter + 2-space gap); actionLetter is the character
+// placed in that column ("D", "*", or "" for unmarked rows).
+// dropStyle toggles the subject to strikethrough+dim (`D` rows only).
+func renderLogRow(c gitcmd.Commit, width int, hasPendingColumn bool, actionLetter string, dropStyle bool) string {
 	const gap = "  "
-	short, date, author, restStyled, _, ok := commitRowColumns(c, width, hasPendingColumn, marked)
+	short, date, author, restStyled, _, ok := commitRowColumns(c, width, hasPendingColumn, dropStyle)
 	if !ok {
 		return padOrTruncate(short, width)
 	}
 	prefix := ""
 	if hasPendingColumn {
-		if marked {
+		switch actionLetter {
+		case "D":
 			prefix = droppedActionStyle.Render("D") + gap
-		} else {
+		case "*":
+			prefix = revertActionStyle.Render("*") + gap
+		default:
 			prefix = " " + gap
 		}
 	}
@@ -3115,19 +4143,19 @@ func renderLogRow(c gitcmd.Commit, width int, hasPendingColumn, marked bool) str
 // hasPendingColumn reserves the leading 3-cell action column; the
 // action letter is emitted plain (the surrounding row-level highlight
 // already wins visually on selected/match rows, per the slice spec).
-func renderLogRowPlain(c gitcmd.Commit, width int, hasPendingColumn, marked bool) string {
+func renderLogRowPlain(c gitcmd.Commit, width int, hasPendingColumn bool, actionLetter string, dropStyle bool) string {
 	const gap = "  "
-	short, date, author, _, restPlain, ok := commitRowColumns(c, width, hasPendingColumn, marked)
+	short, date, author, _, restPlain, ok := commitRowColumns(c, width, hasPendingColumn, dropStyle)
 	if !ok {
 		return padOrTruncate(short, width)
 	}
 	prefix := ""
 	if hasPendingColumn {
-		if marked {
-			prefix = "D" + gap
-		} else {
-			prefix = " " + gap
+		letter := actionLetter
+		if letter == "" {
+			letter = " "
 		}
+		prefix = letter + gap
 	}
 	return prefix + short + gap + date + gap + author + gap + restPlain
 }
@@ -3172,28 +4200,28 @@ func renderLogBody(m model, w, bodyH int, active bool) string {
 		}
 		return strings.Join(lines, "\n")
 	}
-	hasPendingColumn := len(m.pendingActions) > 0
+	hasPendingColumn := m.hasAnyActionMarks()
 	for row := 0; row < bodyH; row++ {
 		idx := m.viewportTop + row
 		if idx >= len(m.commits) {
 			lines = append(lines, strings.Repeat(" ", w))
 			continue
 		}
-		_, marked := m.pendingActions[m.commits[idx].SHA]
+		letter, dropStyle := m.commitActionDisplay(m.commits[idx].SHA)
 		var rendered string
 		switch {
 		case idx == m.selectedIdx:
-			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, marked)
+			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, letter, dropStyle)
 			if active {
 				rendered = activeSelectedRowStyle.Render(plain)
 			} else {
 				rendered = inactiveSelectedRowStyle.Render(plain)
 			}
 		case m.isCommitDimmed(m.commits[idx].SHA):
-			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, marked)
+			plain := renderLogRowPlain(m.commits[idx], w, hasPendingColumn, letter, dropStyle)
 			rendered = commitDimStyle.Render(plain)
 		default:
-			rendered = renderLogRow(m.commits[idx], w, hasPendingColumn, marked)
+			rendered = renderLogRow(m.commits[idx], w, hasPendingColumn, letter, dropStyle)
 		}
 		lines = append(lines, rendered)
 	}
@@ -3518,17 +4546,27 @@ func renderFilesBody(m model, w, bodyH int, active, stale bool) string {
 			lines = append(lines, strings.Repeat(" ", w))
 			continue
 		}
+		// Whole-file revert mark: dim the row when every hunk in this
+		// file has been flagged. Computed against the file's path under
+		// the currently-displayed commit (m.filesSHA).
+		dimRevert := false
+		if m.filesSHA != "" {
+			dimRevert = m.fileFullyFlagged(m.filesSHA, visible[idx].Path)
+		}
 		var rendered string
-		if stale {
+		switch {
+		case stale:
 			rendered = staleStyle.Render(padOrTruncate(fileRowPlain(rows[idx]), w))
-		} else if idx == m.filesSelectedIdx {
+		case idx == m.filesSelectedIdx:
 			plain := padOrTruncate(fileRowPlain(rows[idx]), w)
 			if active {
 				rendered = activeSelectedRowStyle.Render(plain)
 			} else {
 				rendered = inactiveSelectedRowStyle.Render(plain)
 			}
-		} else {
+		case dimRevert:
+			rendered = dimmedFileStyle.Render(padOrTruncate(fileRowPlain(rows[idx]), w))
+		default:
 			rendered = padOrTruncate(fileRowStyled(rows[idx]), w)
 		}
 		lines = append(lines, rendered)
@@ -3579,7 +4617,7 @@ func renderDiffBodyWithScrollbar(m model, w, bodyH int, stale bool) string {
 	if ok && !showStale {
 		return renderDiffPlaceholderBody(w, bodyH, placeholder)
 	}
-	start, length, draw := layout.ScrollbarThumb(len(m.diff.Lines), bodyH, m.diffScroll, bodyH)
+	start, length, draw := layout.ScrollbarThumb(m.diff.RowCount(), bodyH, m.diffScroll, bodyH)
 	if !draw || w < 2 {
 		return renderDiffBody(m, w, bodyH, stale)
 	}
@@ -3602,7 +4640,9 @@ func renderDiffPlaceholderBody(w, bodyH int, placeholder string) string {
 
 // renderDiffBody renders the diff body rows (no title) at the given
 // width and body height, using m.diffScroll as the top-of-viewport row
-// and m.diffHScroll as the horizontal offset.
+// and m.diffHScroll as the horizontal offset. Iteration is in
+// visible-row coordinates so Add lines hidden by a flagged hunk drop
+// out of the rendered output.
 func renderDiffBody(m model, w, bodyH int, stale bool) string {
 	if w <= 0 || bodyH <= 0 {
 		return ""
@@ -3613,15 +4653,20 @@ func renderDiffBody(m model, w, bodyH int, stale bool) string {
 		start = 0
 	}
 	for row := 0; row < bodyH; row++ {
-		idx := start + row
-		if idx >= len(m.diff.Lines) {
+		rowIdx := start + row
+		if rowIdx >= m.diff.RowCount() {
 			lines = append(lines, strings.Repeat(" ", w))
 			continue
 		}
 		if stale {
 			// Render the raw text without diff/syntax colors, padded and
 			// horizontally scrolled the same way FormatLine handles it.
-			ln := m.diff.Lines[idx]
+			li, ok := m.diff.RowLineIndex(rowIdx)
+			if !ok {
+				lines = append(lines, strings.Repeat(" ", w))
+				continue
+			}
+			ln := m.diff.Lines[li]
 			text := ln.Text
 			if m.diffHScroll > 0 {
 				if m.diffHScroll >= len(text) {
@@ -3639,7 +4684,7 @@ func renderDiffBody(m model, w, bodyH int, stale bool) string {
 			}
 			lines = append(lines, staleStyle.Render(padOrTruncate(marker+text, w)))
 		} else {
-			lines = append(lines, m.diff.FormatLineActive(idx, w, m.diffHScroll, m.activeHunk))
+			lines = append(lines, m.diff.FormatRow(rowIdx, w, m.diffHScroll, m.activeHunk))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -3796,20 +4841,42 @@ func (m model) View() string {
 }
 
 // renderRebaseSummaryPopup renders the action-summary popup shown after
-// ctrl+s passes all preconditions. Lists the planned actions (today
-// only "Drop N commits") and the Confirm / Cancel hint.
+// ctrl+s passes all preconditions. The action lines depend on the
+// staged rebase flow: drop-only lists "Drop N commits"; the revert
+// flow lists "Revert N hunks in <short-sha>" and adds a "Drop M
+// commits" line when the combined rebase is also dropping commits.
+// Auto-promote collapses to a single drop line that includes the
+// cursor commit.
 func renderRebaseSummaryPopup(m model) string {
-	drops := 0
-	for _, k := range m.pendingActions {
-		if k == ActionDrop {
-			drops++
-		}
-	}
 	title := modalTitleStyle.Render("Pending actions")
-	action := fmt.Sprintf("Drop %d commit%s", drops, plural2(drops))
 	hint := modalHintStyle.Render("enter confirm · esc cancel")
-
-	rows := []string{title, "", "  " + action, "", hint}
+	rows := []string{title, ""}
+	if m.rebaseFlow == rebaseFlowRevert {
+		short := m.rebaseRevertCursorSHA
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		dropCount := len(m.rebaseRevertDrops)
+		if m.rebaseRevertAutoPromote {
+			dropCount++
+			rows = append(rows, fmt.Sprintf("  Drop %d commit%s", dropCount, plural2(dropCount)))
+		} else {
+			rows = append(rows, fmt.Sprintf("  Revert %d hunk%s in %s",
+				m.rebaseRevertCount, plural2(m.rebaseRevertCount), short))
+			if dropCount > 0 {
+				rows = append(rows, fmt.Sprintf("  Drop %d commit%s", dropCount, plural2(dropCount)))
+			}
+		}
+	} else {
+		drops := 0
+		for _, k := range m.pendingActions {
+			if k == ActionDrop {
+				drops++
+			}
+		}
+		rows = append(rows, fmt.Sprintf("  Drop %d commit%s", drops, plural2(drops)))
+	}
+	rows = append(rows, "", hint)
 	return padAndBorderModal(rows)
 }
 

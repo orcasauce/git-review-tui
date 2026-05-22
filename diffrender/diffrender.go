@@ -25,6 +25,17 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// visRow is one entry in the visible-row view of a Result. A row is
+// either a reference to a Lines index (lineIdx >= 0) or a synthetic
+// placeholder standing in for the collapsed Add block of a flagged
+// pure-Add hunk (lineIdx < 0, hunkIdx names the hunk, collapsedAdds is
+// the number of Add lines hidden by the placeholder).
+type visRow struct {
+	lineIdx       int
+	hunkIdx       int
+	collapsedAdds int
+}
+
 // Kind classifies a single rendered diff line.
 type Kind int
 
@@ -76,6 +87,210 @@ type Result struct {
 	// highlighted is true when chroma identified a lexer for the
 	// filename passed to Parse and produced styled segments.
 	highlighted bool
+	// flagged is parallel to Lines: flagged[i]=true means line i is
+	// part of a hunk flagged for revert and should render as a grey
+	// tombstone. Populated via SetFlaggedHunks; nil disables flagging.
+	flagged []bool
+	// visibleRows is the row-indexed view of Lines. Each entry is
+	// either a reference to a Lines index, or a synthetic placeholder
+	// row standing in for a collapsed Add block in a flagged pure-Add
+	// hunk. Rows whose underlying line is collapsed (Add lines inside a
+	// flagged mixed hunk) are absent. Populated by Parse and recomputed
+	// whenever SetFlaggedHunks is called.
+	visibleRows []visRow
+	// hunkVisStart and hunkVisEnd parallel HunkStarts / HunkEnds and
+	// hold the first and last visible-row indices of each hunk's
+	// changed (+/-) lines. A value of -1 means the hunk has no visible
+	// changed rows (currently only possible for a flagged pure-Add
+	// hunk, whose Adds are all collapsed).
+	hunkVisStart []int
+	hunkVisEnd   []int
+	// adjustedNewNum is parallel to Lines and holds, for each line, its
+	// position in the post-revert new file (the file the user gets if
+	// the currently flagged hunks are reverted). Zero means the line
+	// does not exist in the post-revert file (an unflagged Add or a
+	// flagged Del placeholder that has nothing to anchor to). Rebuilt
+	// by recomputeVisibleRows whenever flagging changes.
+	adjustedNewNum []int
+	// rawHunkStarts / rawHunkOldN / rawHunkNewN record the line index
+	// of each `@@` hunk's first content line in Lines, plus the parsed
+	// pre-image / post-image starting positions from that hunk header.
+	// Used to re-seed the adjustedNewNum walk at every @@ boundary so
+	// the recompute survives multi-hunk diffs.
+	rawHunkStarts []int
+	rawHunkOldN   []int
+	rawHunkNewN   []int
+}
+
+// SetFlaggedHunks marks every line within the given hunk indices as
+// flagged for revert. Subsequent FormatLine/FormatLineActive calls
+// render those lines as a single grey "tombstone" block, distinct
+// from the add (green) and del (red) styling. Out-of-range indices
+// are silently ignored. Passing nil or an empty slice clears all
+// flagging. Also rebuilds the visible-row view so Add lines in
+// flagged hunks drop out of the diff body.
+func (r *Result) SetFlaggedHunks(indices []int) {
+	if len(indices) == 0 {
+		r.flagged = nil
+	} else {
+		r.flagged = make([]bool, len(r.Lines))
+		for _, idx := range indices {
+			if idx < 0 || idx >= len(r.HunkStarts) {
+				continue
+			}
+			first := r.HunkStarts[idx]
+			last := first
+			if idx < len(r.HunkEnds) {
+				last = r.HunkEnds[idx]
+			}
+			if last < first {
+				last = first
+			}
+			for i := first; i <= last && i < len(r.flagged); i++ {
+				r.flagged[i] = true
+			}
+		}
+	}
+	r.recomputeVisibleRows()
+}
+
+// recomputeVisibleRows rebuilds the visible-row view from Lines and the
+// current flagged state. Add lines inside a flagged hunk are dropped
+// from the sequence; everything else is included 1:1. A flagged hunk
+// with zero Del lines gets a single placeholder row in place of its
+// collapsed Adds, so the flagged signal stays visible. Per-hunk first /
+// last visible *changed* row indices are recorded in parallel for the
+// active-hunk frame to anchor against.
+func (r *Result) recomputeVisibleRows() {
+	if cap(r.visibleRows) < len(r.Lines) {
+		r.visibleRows = make([]visRow, 0, len(r.Lines))
+	} else {
+		r.visibleRows = r.visibleRows[:0]
+	}
+	if len(r.hunkVisStart) != len(r.HunkStarts) {
+		r.hunkVisStart = make([]int, len(r.HunkStarts))
+		r.hunkVisEnd = make([]int, len(r.HunkStarts))
+	}
+	for i := range r.hunkVisStart {
+		r.hunkVisStart[i] = -1
+		r.hunkVisEnd[i] = -1
+	}
+
+	r.recomputeAdjustedNewNum()
+
+	// Build a per-line hunk index so each line knows which hunk (if any)
+	// it belongs to, then precompute per-hunk Del presence and Add
+	// counts so flagged pure-Add hunks can be detected on the fly.
+	lineHunk := make([]int, len(r.Lines))
+	for i := range lineHunk {
+		lineHunk[i] = -1
+	}
+	hunkHasDel := make([]bool, len(r.HunkStarts))
+	hunkAddCount := make([]int, len(r.HunkStarts))
+	for h := range r.HunkStarts {
+		s := r.HunkStarts[h]
+		e := s
+		if h < len(r.HunkEnds) {
+			e = r.HunkEnds[h]
+		}
+		if e < s {
+			e = s
+		}
+		for i := s; i <= e && i < len(r.Lines); i++ {
+			lineHunk[i] = h
+			switch r.Lines[i].Kind {
+			case Del:
+				hunkHasDel[h] = true
+			case Add:
+				hunkAddCount[h]++
+			}
+		}
+	}
+
+	placeholderEmitted := make([]bool, len(r.HunkStarts))
+	for i, ln := range r.Lines {
+		flagged := r.isFlagged(i)
+		h := lineHunk[i]
+		if flagged && ln.Kind == Add {
+			if h >= 0 && !hunkHasDel[h] && !placeholderEmitted[h] {
+				rowIdx := len(r.visibleRows)
+				r.visibleRows = append(r.visibleRows, visRow{
+					lineIdx:       -1,
+					hunkIdx:       h,
+					collapsedAdds: hunkAddCount[h],
+				})
+				placeholderEmitted[h] = true
+				r.hunkVisStart[h] = rowIdx
+				r.hunkVisEnd[h] = rowIdx
+			}
+			continue
+		}
+		rowIdx := len(r.visibleRows)
+		r.visibleRows = append(r.visibleRows, visRow{lineIdx: i})
+		if h >= 0 && (ln.Kind == Add || ln.Kind == Del) {
+			if r.hunkVisStart[h] < 0 {
+				r.hunkVisStart[h] = rowIdx
+			}
+			r.hunkVisEnd[h] = rowIdx
+		}
+	}
+}
+
+// recomputeAdjustedNewNum walks Lines once and populates adjustedNewNum
+// with each line's position in the post-revert new file. A flagged hunk
+// contributes zero net shift to the new-file cursor: its Adds don't
+// advance nextNew (they vanish post-revert) and its Dels do advance
+// nextNew (they're restored). An unflagged hunk's contribution is the
+// usual adds − dels. Counters are seeded per `@@`-hunk from the parsed
+// header so multi-hunk diffs work.
+func (r *Result) recomputeAdjustedNewNum() {
+	if cap(r.adjustedNewNum) < len(r.Lines) {
+		r.adjustedNewNum = make([]int, len(r.Lines))
+	} else {
+		r.adjustedNewNum = r.adjustedNewNum[:len(r.Lines)]
+		for i := range r.adjustedNewNum {
+			r.adjustedNewNum[i] = 0
+		}
+	}
+	var nextOld, nextNew int
+	hunkPtr := 0
+	for i, ln := range r.Lines {
+		for hunkPtr < len(r.rawHunkStarts) && r.rawHunkStarts[hunkPtr] == i {
+			nextOld = r.rawHunkOldN[hunkPtr]
+			nextNew = r.rawHunkNewN[hunkPtr]
+			hunkPtr++
+		}
+		flagged := r.isFlagged(i)
+		switch ln.Kind {
+		case Context:
+			r.adjustedNewNum[i] = nextNew
+			nextOld++
+			nextNew++
+		case Add:
+			if flagged {
+				r.adjustedNewNum[i] = 0
+			} else {
+				r.adjustedNewNum[i] = nextNew
+				nextNew++
+			}
+		case Del:
+			if flagged {
+				r.adjustedNewNum[i] = nextNew
+				nextOld++
+				nextNew++
+			} else {
+				r.adjustedNewNum[i] = 0
+				nextOld++
+			}
+		}
+	}
+}
+
+func (r Result) isFlagged(idx int) bool {
+	if idx < 0 || idx >= len(r.flagged) {
+		return false
+	}
+	return r.flagged[idx]
 }
 
 // Parse parses a raw unified diff into a Result. raw is the full-file
@@ -92,6 +307,7 @@ func Parse(raw, hunksDiff, filename string) Result {
 	inHunk := false
 	hasCombined := false
 	rawHunkStarts := []int{}
+	var rawHunkOldN, rawHunkNewN []int
 	for _, ln := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(ln, "@@@") {
 			hasCombined = true
@@ -99,6 +315,8 @@ func Parse(raw, hunksDiff, filename string) Result {
 		if strings.HasPrefix(ln, "@@") {
 			oldN, newN = parseHunkHeader(ln)
 			rawHunkStarts = append(rawHunkStarts, len(lines))
+			rawHunkOldN = append(rawHunkOldN, oldN)
+			rawHunkNewN = append(rawHunkNewN, newN)
 			inHunk = true
 			continue
 		}
@@ -137,7 +355,14 @@ func Parse(raw, hunksDiff, filename string) Result {
 	} else {
 		hunkStarts, hunkEnds = extractHunkBounds(lines, hunksDiff)
 	}
-	r := Result{Lines: lines, HunkStarts: hunkStarts, HunkEnds: hunkEnds}
+	r := Result{
+		Lines:         lines,
+		HunkStarts:    hunkStarts,
+		HunkEnds:      hunkEnds,
+		rawHunkStarts: rawHunkStarts,
+		rawHunkOldN:   rawHunkOldN,
+		rawHunkNewN:   rawHunkNewN,
+	}
 	for _, l := range lines {
 		if l.OldNum > r.OldW {
 			r.OldW = l.OldNum
@@ -155,6 +380,7 @@ func Parse(raw, hunksDiff, filename string) Result {
 			r.Lines[i].segs = highlightLine(lex, r.Lines[i].Text)
 		}
 	}
+	r.recomputeVisibleRows()
 	return r
 }
 
@@ -294,12 +520,22 @@ func numWidth(n int) int {
 // delBodyBg are those hues darkened ~60% to match nvim's DiffAdd /
 // DiffDelete construction. invertedFg is base00, the terminal-background
 // colour, used as foreground on the saturated gutter band.
+//
+// flagGutterBg / flagBodyBg / flagFg are the grey "tombstone" tones used
+// to render hunks flagged for revert (see prd-hunk-revert.md). The
+// grey gutter sits at roughly the saturation level of add/del gutters;
+// the body bg matches the darkness of add/del body bgs; the body fg is
+// applied to chroma-highlighted lines too so syntax colour does not
+// re-introduce a non-grey signal inside a tombstone block.
 const (
-	addGutterBg = "#8f9d6a"
-	delGutterBg = "#cf6a4c"
-	addBodyBg   = "#393e2a"
-	delBodyBg   = "#522a1e"
-	invertedFg  = "#1e1e1e"
+	addGutterBg  = "#8f9d6a"
+	delGutterBg  = "#cf6a4c"
+	addBodyBg    = "#393e2a"
+	delBodyBg    = "#522a1e"
+	flagGutterBg = "#6c6c6c"
+	flagBodyBg   = "#2e2e2e"
+	flagFg       = "#9e9e9e"
+	invertedFg   = "#1e1e1e"
 )
 
 var (
@@ -311,8 +547,12 @@ var (
 	delGutterBandStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color(delGutterBg)).
 				Foreground(lipgloss.Color(invertedFg))
-	addBodyBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(addBodyBg))
-	delBodyBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(delBodyBg))
+	flagGutterBandStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color(flagGutterBg)).
+				Foreground(lipgloss.Color(invertedFg))
+	addBodyBgStyle  = lipgloss.NewStyle().Background(lipgloss.Color(addBodyBg))
+	delBodyBgStyle  = lipgloss.NewStyle().Background(lipgloss.Color(delBodyBg))
+	flagBodyStyle   = lipgloss.NewStyle().Background(lipgloss.Color(flagBodyBg)).Foreground(lipgloss.Color(flagFg))
 )
 
 // chromaFor returns the lexer to use for filename, or ok=false when
@@ -445,7 +685,8 @@ func (r Result) HunkRange(activeHunk int) (first, last int, ok bool) {
 // FormatLineActive renders Lines[idx] like FormatLine and additionally
 // wraps the result with an SGR overline when idx is the first line of
 // activeHunk and/or an SGR underline when it is the last. The boundary
-// color (SGR 58) reflects the line's Kind: add→addGutterBg, del→
+// color (SGR 58) reflects whether the line is flagged for revert and,
+// if not, its Kind: flagged→flagGutterBg, add→addGutterBg, del→
 // delGutterBg, context→default (no SGR 58 emitted). activeHunk < 0
 // disables the decoration.
 func (r Result) FormatLineActive(idx, width, hScroll, activeHunk int) string {
@@ -459,28 +700,145 @@ func (r Result) FormatLineActive(idx, width, hScroll, activeHunk int) string {
 	if !isFirst && !isLast {
 		return s
 	}
-	var active strings.Builder
-	if isFirst {
-		active.WriteString("\x1b[53m")
-	}
-	if isLast {
-		active.WriteString("\x1b[4m")
-	}
-	switch r.Lines[idx].Kind {
-	case Add:
-		active.WriteString("\x1b[58;2;143;157;106m")
-	case Del:
-		active.WriteString("\x1b[58;2;207;106;76m")
-	}
-	activeSGR := active.String()
-	if activeSGR == "" {
+	if idx < 0 || idx >= len(r.Lines) {
 		return s
 	}
-	// Re-emit the active-state SGR after every embedded reset so the
-	// overline/underline survive lipgloss's per-segment "\x1b[0m" that
-	// would otherwise clear them mid-line.
-	s = strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+activeSGR)
-	return activeSGR + s + "\x1b[0m"
+	return wrapActiveSGR(s, activeBorderSGR(isFirst, isLast, r.Lines[idx].Kind, r.isFlagged(idx)))
+}
+
+// activeBorderSGR builds the SGR prefix that frames an active-hunk
+// anchor row: overline on the first row, underline on the last, and
+// SGR 58 (underline colour) chosen by flagged / Kind.
+func activeBorderSGR(isFirst, isLast bool, kind Kind, flagged bool) string {
+	var b strings.Builder
+	if isFirst {
+		b.WriteString("\x1b[53m")
+	}
+	if isLast {
+		b.WriteString("\x1b[4m")
+	}
+	switch {
+	case flagged:
+		b.WriteString("\x1b[58;2;108;108;108m")
+	case kind == Add:
+		b.WriteString("\x1b[58;2;143;157;106m")
+	case kind == Del:
+		b.WriteString("\x1b[58;2;207;106;76m")
+	}
+	return b.String()
+}
+
+// wrapActiveSGR wraps s with the given active-frame SGR prefix and an
+// SGR reset suffix, and re-emits the prefix after every embedded reset
+// so the overline / underline survive lipgloss's per-segment "\x1b[0m"
+// that would otherwise clear them mid-line. Returns s unchanged when
+// the prefix is empty.
+func wrapActiveSGR(s, sgr string) string {
+	if sgr == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+sgr)
+	return sgr + s + "\x1b[0m"
+}
+
+// RowCount returns the number of rows in the visible-row view of Lines.
+// Add lines inside flagged hunks are absent; every other line is
+// present 1:1. When no hunks are flagged, RowCount() equals len(Lines).
+func (r Result) RowCount() int {
+	return len(r.visibleRows)
+}
+
+// RowLineIndex resolves a visible-row index back to its underlying
+// Lines index. Returns ok=false when rowIdx is out of range or refers
+// to a synthetic placeholder row (which has no underlying Lines entry).
+func (r Result) RowLineIndex(rowIdx int) (int, bool) {
+	if rowIdx < 0 || rowIdx >= len(r.visibleRows) {
+		return 0, false
+	}
+	vr := r.visibleRows[rowIdx]
+	if vr.lineIdx < 0 {
+		return 0, false
+	}
+	return vr.lineIdx, true
+}
+
+// HunkVisibleRange returns the first and last visible-row indices of
+// the hunk at position hunkIdx — anchored on the first and last
+// visible changed (+/-) line of that hunk. For unflagged hunks this
+// matches HunkRange in row space. For a flagged mixed hunk it spans
+// the first and last visible Del line. Returns ok=false when the
+// hunk has no visible changed rows (a flagged pure-Add hunk under
+// the issue-15 row model) or when hunkIdx is out of range.
+func (r Result) HunkVisibleRange(hunkIdx int) (firstRow, lastRow int, ok bool) {
+	if hunkIdx < 0 || hunkIdx >= len(r.hunkVisStart) {
+		return 0, 0, false
+	}
+	if r.hunkVisStart[hunkIdx] < 0 {
+		return 0, 0, false
+	}
+	return r.hunkVisStart[hunkIdx], r.hunkVisEnd[hunkIdx], true
+}
+
+// FormatRow renders the visible-row at rowIdx — the row-indexed
+// equivalent of FormatLineActive. The active-hunk frame anchors on
+// HunkVisibleRange(activeHunk), so the overline / underline land on
+// the first and last *visible* rows of the active hunk. Placeholder
+// rows for collapsed Add blocks render as a full-width grey bar with
+// centered "── N lines reverted ──" text.
+func (r Result) FormatRow(rowIdx, width, hScroll, activeHunk int) string {
+	if rowIdx < 0 || rowIdx >= len(r.visibleRows) {
+		return ""
+	}
+	vr := r.visibleRows[rowIdx]
+	if vr.lineIdx < 0 {
+		s := formatPlaceholder(vr.collapsedAdds, width)
+		if activeHunk != vr.hunkIdx {
+			return s
+		}
+		firstRow, lastRow, ok := r.HunkVisibleRange(activeHunk)
+		if !ok {
+			return s
+		}
+		isFirst := rowIdx == firstRow
+		isLast := rowIdx == lastRow
+		if !isFirst && !isLast {
+			return s
+		}
+		return wrapActiveSGR(s, activeBorderSGR(isFirst, isLast, Context, true))
+	}
+	li := vr.lineIdx
+	s := r.FormatLine(li, width, hScroll)
+	firstRow, lastRow, ok := r.HunkVisibleRange(activeHunk)
+	if !ok {
+		return s
+	}
+	isFirst := rowIdx == firstRow
+	isLast := rowIdx == lastRow
+	if !isFirst && !isLast {
+		return s
+	}
+	return wrapActiveSGR(s, activeBorderSGR(isFirst, isLast, r.Lines[li].Kind, r.isFlagged(li)))
+}
+
+// formatPlaceholder renders the synthetic placeholder row for a
+// flagged pure-Add hunk: a full-width grey bar carrying the centered
+// "── N lines reverted ──" message. The bg/fg match the flagged
+// tombstone palette so the row reads as part of the flagged region.
+func formatPlaceholder(collapsed, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	msg := "── " + strconv.Itoa(collapsed) + " lines reverted ──"
+	msgRunes := []rune(msg)
+	var body string
+	if len(msgRunes) >= width {
+		body = string(msgRunes[:width])
+	} else {
+		leftPad := (width - len(msgRunes)) / 2
+		rightPad := width - len(msgRunes) - leftPad
+		body = strings.Repeat(" ", leftPad) + msg + strings.Repeat(" ", rightPad)
+	}
+	return flagBodyStyle.Render(body)
 }
 
 // FormatLine renders Lines[idx] to a single ANSI-styled string of
@@ -492,18 +850,23 @@ func (r Result) FormatLine(idx, width, hScroll int) string {
 		return ""
 	}
 	l := r.Lines[idx]
-	gutter := r.formatGutter(l)
+	flagged := r.isFlagged(idx)
+	adjNew := 0
+	if idx < len(r.adjustedNewNum) {
+		adjNew = r.adjustedNewNum[idx]
+	}
+	gutter := r.formatGutter(l, flagged, adjNew)
 	bodyW := width - r.GutterRenderWidth()
 	if bodyW < 0 {
 		bodyW = 0
 	}
 	if l.segs != nil {
-		return gutter + formatHighlightedBody(l, bodyW, hScroll)
+		return gutter + formatHighlightedBody(l, bodyW, hScroll, flagged)
 	}
-	return gutter + formatPlainBody(l, bodyW, hScroll)
+	return gutter + formatPlainBody(l, bodyW, hScroll, flagged)
 }
 
-func formatPlainBody(l Line, bodyW, hScroll int) string {
+func formatPlainBody(l Line, bodyW, hScroll int, flagged bool) string {
 	text := l.Text
 	if hScroll > 0 {
 		runes := []rune(text)
@@ -519,6 +882,9 @@ func formatPlainBody(l Line, bodyW, hScroll int) string {
 	} else if bodyW > len(body) {
 		body += strings.Repeat(" ", bodyW-len(body))
 	}
+	if flagged {
+		return flagBodyStyle.Render(body)
+	}
 	switch l.Kind {
 	case Add:
 		return addBodyBgStyle.Render(body)
@@ -532,7 +898,7 @@ func formatPlainBody(l Line, bodyW, hScroll int) string {
 // cells of the content; bodyW truncates to that many cells. On add/del
 // rows the body tint is composed onto each segment's chroma style so the
 // per-token foreground renders over the tint.
-func formatHighlightedBody(l Line, bodyW, hScroll int) string {
+func formatHighlightedBody(l Line, bodyW, hScroll int, flagged bool) string {
 	if bodyW == 0 {
 		return ""
 	}
@@ -542,6 +908,9 @@ func formatHighlightedBody(l Line, bodyW, hScroll int) string {
 		bodyBg = addBodyBg
 	case Del:
 		bodyBg = delBodyBg
+	}
+	if flagged {
+		bodyBg = flagBodyBg
 	}
 
 	var b strings.Builder
@@ -568,7 +937,11 @@ func formatHighlightedBody(l Line, bodyW, hScroll int) string {
 			runes = runes[:bodyW-cells]
 		}
 		s := seg.style
-		if bodyBg != "" {
+		if flagged {
+			// Override per-token chroma colour with the tombstone grey
+			// foreground so the block reads as one neutral region.
+			s = lipgloss.NewStyle().Foreground(lipgloss.Color(flagFg)).Background(lipgloss.Color(flagBodyBg))
+		} else if bodyBg != "" {
 			s = s.Background(lipgloss.Color(bodyBg))
 		}
 		b.WriteString(s.Render(string(runes)))
@@ -576,10 +949,12 @@ func formatHighlightedBody(l Line, bodyW, hScroll int) string {
 	}
 	if cells < bodyW {
 		pad := strings.Repeat(" ", bodyW-cells)
-		switch l.Kind {
-		case Add:
+		switch {
+		case flagged:
+			b.WriteString(flagBodyStyle.Render(pad))
+		case l.Kind == Add:
 			b.WriteString(addBodyBgStyle.Render(pad))
-		case Del:
+		case l.Kind == Del:
 			b.WriteString(delBodyBgStyle.Render(pad))
 		default:
 			b.WriteString(pad)
@@ -594,17 +969,22 @@ func formatHighlightedBody(l Line, bodyW, hScroll int) string {
 // as one coloured tag — the row's banded body background carries the
 // add/del signal, so no `+`/`-` glyph is needed. On context rows the
 // band keeps the muted gutterStyle foreground over the default
-// background.
-func (r Result) formatGutter(l Line) string {
+// background. The right-side NewNum is taken from the adjusted
+// (post-revert) value and is shown only when positive and != OldNum,
+// so the column adds no information when it would duplicate OldNum.
+func (r Result) formatGutter(l Line, flagged bool, adjNewNum int) string {
 	oldS := ""
 	if l.OldNum > 0 {
 		oldS = strconv.Itoa(l.OldNum)
 	}
 	newS := ""
-	if l.NewNum > 0 {
-		newS = strconv.Itoa(l.NewNum)
+	if adjNewNum > 0 && adjNewNum != l.OldNum {
+		newS = strconv.Itoa(adjNewNum)
 	}
 	nums := padLeft(oldS, r.OldW) + " " + padLeft(newS, r.NewW) + " "
+	if flagged {
+		return flagGutterBandStyle.Render(nums)
+	}
 	switch l.Kind {
 	case Add:
 		return addGutterBandStyle.Render(nums)

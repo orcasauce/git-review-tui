@@ -10,9 +10,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 	"github.com/orcasauce/git-review-tui/filefilter"
+	"github.com/orcasauce/git-review-tui/fileid"
 	"github.com/orcasauce/git-review-tui/gitcmd"
 	"github.com/orcasauce/git-review-tui/layout"
 	"github.com/orcasauce/git-review-tui/loader"
+	"github.com/orcasauce/git-review-tui/revertstate"
 )
 
 func init() {
@@ -58,6 +60,10 @@ func newRenderModel(w, h, ncommits, selectedIdx, viewportTop int) model {
 		viewportTop:       viewportTop,
 		branch:            "main",
 		pendingActions:    map[string]ActionKind{},
+		reverts:           revertstate.New(),
+		fileIDs:           fileid.New(),
+		hunkTotals:        map[string]int{},
+		filesByCommit:     map[string][]gitcmd.FileStat{},
 		files:             files,
 		fileFilterVisible: visible,
 		filesSHA:          commits[selectedIdx].SHA,
