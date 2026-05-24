@@ -47,6 +47,100 @@ func (t *Tracker) Set(sha, path string, idx int) {
 	t.indices[key(sha, path)] = idx
 }
 
+// Kind distinguishes the two shapes of AdvancePlan returned by
+// PlanAdvance: a within-file step or a cross-file step.
+type Kind int
+
+const (
+	// WithinFile means the caller should set its active hunk index to
+	// AdvancePlan.NewHunkIdx without changing the selected file.
+	WithinFile Kind = iota
+	// CrossFile means the caller should switch file selection to
+	// AdvancePlan.NewFileIdx and, once the destination file's diff
+	// loads, land on the hunk indicated by AdvancePlan.Position.
+	CrossFile
+)
+
+// Position is which hunk the caller should land on after a CrossFile
+// step: the first hunk for forward navigation, the last for backward.
+type Position int
+
+const (
+	// First lands on hunk index 0 of the destination file.
+	First Position = iota
+	// Last lands on the destination file's final hunk
+	// (total - 1).
+	Last
+)
+
+// AdvancePlan is the result of PlanAdvance. When Kind is WithinFile
+// only NewHunkIdx is meaningful; when Kind is CrossFile only
+// NewFileIdx and Position are meaningful.
+type AdvancePlan struct {
+	Kind       Kind
+	NewHunkIdx int
+	NewFileIdx int
+	Position   Position
+}
+
+// PlanAdvance describes the next n/N navigation step. It is pure: no
+// I/O, no async coordination, no awareness of binaries, filters, or
+// the model. Callers pass the *visible* file index and count (already
+// filter-resolved) and receive back either a WithinFile step (caller
+// advances activeHunk in place) or a CrossFile step (caller switches
+// file selection and applies the indicated landing position when the
+// new diff arrives).
+//
+// dir is +1 for forward (n) and -1 for backward (N).
+//
+// The single-file case (numFiles == 1) is not specially handled:
+// PlanAdvance returns a CrossFile result whose NewFileIdx wraps to
+// the same file. The caller still goes through the file-switch path,
+// naturally producing same-file wrap behavior.
+//
+// A negative currentHunkIdx is treated as 0 (matching Advance), so a
+// NoActiveHunk input with positive currentHunkTotal does not violate
+// the contract — though in practice the model never passes that
+// combination.
+func PlanAdvance(currentFileIdx, currentHunkIdx, currentHunkTotal, numFiles, dir int) AdvancePlan {
+	if !atBoundary(currentHunkIdx, currentHunkTotal, dir) {
+		return AdvancePlan{
+			Kind:       WithinFile,
+			NewHunkIdx: Advance(currentHunkIdx, currentHunkTotal, dir),
+		}
+	}
+	pos := First
+	if dir < 0 {
+		pos = Last
+	}
+	newFile := 0
+	if numFiles > 0 {
+		newFile = ((currentFileIdx+dir)%numFiles + numFiles) % numFiles
+	}
+	return AdvancePlan{
+		Kind:       CrossFile,
+		NewFileIdx: newFile,
+		Position:   pos,
+	}
+}
+
+func atBoundary(currentHunkIdx, currentHunkTotal, dir int) bool {
+	if currentHunkTotal <= 0 {
+		return true
+	}
+	ch := currentHunkIdx
+	if ch < 0 {
+		ch = 0
+	}
+	if dir > 0 && ch == currentHunkTotal-1 {
+		return true
+	}
+	if dir < 0 && ch == 0 {
+		return true
+	}
+	return false
+}
+
 // Advance returns the new active hunk index after stepping `dir` from
 // `current`, wrapping at both ends. Returns NoActiveHunk when total is
 // zero. A negative `current` is treated as 0 (i.e. the first hunk is

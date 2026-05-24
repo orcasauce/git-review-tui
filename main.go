@@ -134,6 +134,15 @@ type model struct {
 	// last position.
 	activeHunk int
 	hunks      *hunkstate.Tracker
+	// pendingHunkPosition is the transient "land on first/last hunk
+	// when this file's diff arrives" intent set by a cross-file n/N
+	// press. The DiffResult handler consumes it (overriding the
+	// tracker's default and persisting the override) and resets it to
+	// pendingNone. Any non-cross selection change clears it via
+	// onFileSelectionChanged / onSelectionChanged so a mid-flight j/k
+	// or commit move doesn't snap the eventual diff load to an
+	// unexpected hunk.
+	pendingHunkPosition pendingHunkPos
 	// reverts tracks revert marks on individual hunks across the
 	// session. `d` while the diff panel is focused toggles a mark on
 	// the active hunk; rendering surfaces flagged hunks as a grey
@@ -388,6 +397,16 @@ const (
 	rebaseStateRefuse
 	rebaseStateConflict
 	rebaseStateManualWait
+)
+
+// pendingHunkPos is the cross-file n/N landing intent. See
+// model.pendingHunkPosition for lifetime details.
+type pendingHunkPos int
+
+const (
+	pendingNone pendingHunkPos = iota
+	pendingFirst
+	pendingLast
 )
 
 func initialModel(git *gitcmd.Client, branch, worktreeLabel string) model {
@@ -818,7 +837,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.hunkTotals = map[string]int{}
 		}
 		m.hunkTotals[hunkTotalsKey(msg.SHA, msg.Path)] = len(m.diff.HunkStarts)
-		m.activeHunk = m.hunks.Get(msg.SHA, msg.Path, len(m.diff.HunkStarts))
+		total := len(m.diff.HunkStarts)
+		// A pending cross-file landing intent overrides the tracker's
+		// default and is persisted so a later j/k back to this file
+		// returns to the new index. A zero-hunk diff (binary or
+		// otherwise empty) drops the intent — there's nowhere to land.
+		switch m.pendingHunkPosition {
+		case pendingFirst:
+			if total > 0 {
+				m.activeHunk = 0
+				m.hunks.Set(msg.SHA, msg.Path, 0)
+			} else {
+				m.activeHunk = hunkstate.NoActiveHunk
+			}
+			m.pendingHunkPosition = pendingNone
+		case pendingLast:
+			if total > 0 {
+				m.activeHunk = total - 1
+				m.hunks.Set(msg.SHA, msg.Path, total-1)
+			} else {
+				m.activeHunk = hunkstate.NoActiveHunk
+			}
+			m.pendingHunkPosition = pendingNone
+		default:
+			m.activeHunk = m.hunks.Get(msg.SHA, msg.Path, total)
+		}
 		m.scrollToActiveHunk()
 		return m, nil
 
@@ -934,12 +977,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openFileFilterPrompt()
 			return m, nil
 		case "n":
-			if m.fileListSection() {
+			if m.active == sectionFiles {
+				return m.crossFileNavigateOrAdvance(1)
+			}
+			if m.active == sectionDiff {
 				m.advanceActiveHunk(1)
 				return m, nil
 			}
 		case "N":
-			if m.fileListSection() {
+			if m.active == sectionFiles {
+				return m.crossFileNavigateOrAdvance(-1)
+			}
+			if m.active == sectionDiff {
 				m.advanceActiveHunk(-1)
 				return m, nil
 			}
@@ -3080,6 +3129,9 @@ func (m model) refresh() (tea.Model, tea.Cmd) {
 // arrives.
 func (m *model) onSelectionChanged() tea.Cmd {
 	m.msgScroll = 0
+	// A commit move drops any pending cross-file landing intent; the
+	// new commit's diffs are unrelated.
+	m.pendingHunkPosition = pendingNone
 	m.detailLoading = true
 	m.filesLoading = true
 	// Cancel any in-flight diff load; we won't know the new file path
@@ -3108,6 +3160,10 @@ func (m *model) onSelectionChanged() tea.Cmd {
 // fresh Diff fetch for the new (sha, path) pair. Prior diff content is
 // kept on screen (dimmed) until the new diff lands.
 func (m *model) onFileSelectionChanged() tea.Cmd {
+	// Any non-cross selection change drops the pending cross-file
+	// landing intent. The n/N cross handler re-sets it *after*
+	// calling this function, so the clear here doesn't fight the set.
+	m.pendingHunkPosition = pendingNone
 	cmd := m.startDiffForSelection()
 	if spin := m.startSpinnerCmd(); spin != nil {
 		return tea.Batch(cmd, spin)
@@ -3369,6 +3425,52 @@ func (m *model) pageDiff(delta int) {
 func (m *model) jumpDiffBottom() {
 	m.diffScroll = m.diff.RowCount()
 	m.clampDiffScroll()
+}
+
+// crossFileNavigateOrAdvance handles n / N when the file panel is
+// focused. It consults hunkstate.PlanAdvance: a WithinFile result
+// delegates to the existing in-file step; a CrossFile result switches
+// file selection and sets m.pendingHunkPosition so the destination
+// file's DiffResult handler lands on the first / last hunk and
+// persists that override in the hunk tracker.
+//
+// m.pendingHunkPosition is set *after* onFileSelectionChanged is
+// called, so the selection-change hook's clear-pending step doesn't
+// stomp the intent we just established.
+func (m model) crossFileNavigateOrAdvance(dir int) (tea.Model, tea.Cmd) {
+	plan := hunkstate.PlanAdvance(
+		m.filesSelectedIdx,
+		m.activeHunk,
+		len(m.diff.HunkStarts),
+		len(m.fileFilterVisible),
+		dir,
+	)
+	switch plan.Kind {
+	case hunkstate.WithinFile:
+		m.advanceActiveHunk(dir)
+		return m, nil
+	case hunkstate.CrossFile:
+		if plan.NewFileIdx < 0 || plan.NewFileIdx >= len(m.fileFilterVisible) {
+			return m, nil
+		}
+		m.filesSelectedIdx = plan.NewFileIdx
+		m.clampFilesViewport()
+		cmd := m.onFileSelectionChanged()
+		// Only carry the intent when the destination has a text diff
+		// to land on. For a binary destination, startDiffForSelection
+		// has already set activeHunk = NoActiveHunk synchronously and
+		// no DiffResult will arrive to consume the intent.
+		if origIdx := m.selectedFileOrigIdx(); origIdx >= 0 && !m.files[origIdx].IsBinary {
+			switch plan.Position {
+			case hunkstate.First:
+				m.pendingHunkPosition = pendingFirst
+			case hunkstate.Last:
+				m.pendingHunkPosition = pendingLast
+			}
+		}
+		return m, cmd
+	}
+	return m, nil
 }
 
 // advanceActiveHunk steps the active hunk index by `dir` (with wrap),
