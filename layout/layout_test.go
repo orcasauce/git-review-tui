@@ -360,3 +360,76 @@ func TestScrollbarThumbMonotonic(t *testing.T) {
 		t.Fatalf("at max offset, thumb end = %d, want %d", lastStart+lastLength, height)
 	}
 }
+
+func TestComputeWithShrinksMiddleRow(t *testing.T) {
+	w, h := 140, 60
+	full := Compute(w, h)
+	if full.TooSmall || full.SmallMode {
+		t.Fatalf("baseline layout should be full-mode: %+v", full)
+	}
+
+	// One visible file should produce a 2-row files panel (1 title +
+	// 1 content row), shrinking the middle row and growing the diff.
+	got := ComputeWith(w, h, 1)
+	if got.TooSmall || got.SmallMode {
+		t.Fatalf("expected full-mode layout, got %+v", got)
+	}
+	if got.Files.H != 2 {
+		t.Fatalf("Files.H = %d, want 2 (1 title + 1 content)", got.Files.H)
+	}
+	if got.Metadata.H != MetadataContentRows {
+		t.Fatalf("Metadata.H = %d, want %d", got.Metadata.H, MetadataContentRows)
+	}
+	if got.Message.H != MetadataContentRows+got.Files.H {
+		t.Fatalf("Message.H = %d, want %d (left column total)", got.Message.H, MetadataContentRows+got.Files.H)
+	}
+	delta := full.Diff.H - got.Diff.H
+	if delta >= 0 {
+		t.Fatalf("expected diff to grow when shrinking middle, full.Diff.H=%d got.Diff.H=%d", full.Diff.H, got.Diff.H)
+	}
+	// Diff grew by the same amount the middle row shrank.
+	wantGrow := (full.Files.H + full.Metadata.H) - (got.Files.H + got.Metadata.H)
+	if -delta != wantGrow {
+		t.Fatalf("diff grew by %d, want %d", -delta, wantGrow)
+	}
+	if got.Diff.Y != full.Diff.Y-wantGrow {
+		t.Fatalf("Diff.Y = %d, want %d", got.Diff.Y, full.Diff.Y-wantGrow)
+	}
+}
+
+func TestComputeWithZeroVisibleFilesKeepsRow(t *testing.T) {
+	w, h := 140, 60
+	got := ComputeWith(w, h, 0)
+	if got.Files.H != 2 {
+		t.Fatalf("Files.H = %d, want 2 (floor of 1 content row)", got.Files.H)
+	}
+}
+
+func TestComputeWithLargeVisibleFilesCappedAtDefault(t *testing.T) {
+	w, h := 140, 60
+	full := Compute(w, h)
+	got := ComputeWith(w, h, 999)
+	if got.Files != full.Files || got.Metadata != full.Metadata ||
+		got.Message != full.Message || got.Diff != full.Diff {
+		t.Fatalf("large visibleFiles should match full layout\nfull=%+v\n got=%+v", full, got)
+	}
+}
+
+func TestComputeNegativeVisibleFilesEqualsCompute(t *testing.T) {
+	w, h := 140, 60
+	if ComputeWith(w, h, -1) != Compute(w, h) {
+		t.Fatalf("ComputeWith(-1) should equal Compute")
+	}
+}
+
+func TestComputeWithSmallModeNoShrink(t *testing.T) {
+	w, h := SmallModeMinCols-1, 60
+	full := Compute(w, h)
+	got := ComputeWith(w, h, 1)
+	if !got.SmallMode {
+		t.Fatalf("expected small mode at w=%d", w)
+	}
+	if got.Files != full.Files || got.Diff != full.Diff {
+		t.Fatalf("small mode should not shrink; full=%+v got=%+v", full, got)
+	}
+}

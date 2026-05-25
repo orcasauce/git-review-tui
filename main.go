@@ -933,7 +933,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// churn selection / scroll state. The normal four-panel UI
 		// resumes from its prior state as soon as the terminal is resized
 		// back above the threshold.
-		if layout.Compute(m.w, m.h).TooSmall {
+		if m.layout().TooSmall {
 			switch keyStr {
 			case "q", "ctrl+c":
 				return m, tea.Quit
@@ -1005,7 +1005,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// activates the next region (middle in small mode, files
 			// in full mode); from the middle region it advances to
 			// the diff. From diff it's a no-op.
-			lo := layout.Compute(m.w, m.h)
+			lo := m.layout()
 			if m.active == sectionLog {
 				if lo.SmallMode {
 					m.active = m.middleFocusSection()
@@ -1026,12 +1026,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.advanceTab(-1)
 			return m, nil
 		case "ctrl+h":
-			if layout.Compute(m.w, m.h).SmallMode && m.inMiddleRegion() {
+			if m.layout().SmallMode && m.inMiddleRegion() {
 				m.rotateMiddleTab(-1)
 				return m, nil
 			}
 		case "ctrl+l":
-			if layout.Compute(m.w, m.h).SmallMode && m.inMiddleRegion() {
+			if m.layout().SmallMode && m.inMiddleRegion() {
 				m.rotateMiddleTab(1)
 				return m, nil
 			}
@@ -1243,7 +1243,7 @@ func (m *model) middleFocusSection() section {
 // cycle is unaffected by the message-fits state because the explicit
 // middle-tab strip is the user's chosen way to land on message there.
 func (m *model) advanceTab(dir int) {
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.SmallMode {
 		// Three logical regions: log, middle, diff. Map the current
 		// section onto one of them, advance, then map back.
@@ -3295,7 +3295,7 @@ func (m *model) currentSelection() (sha, path string, ok bool) {
 // terminal is too small or any modal / prompt is open so they
 // can't bypass those gates.
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		return m, nil
 	}
@@ -3536,7 +3536,7 @@ func (m *model) diffPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		return 0
 	}
@@ -3594,7 +3594,7 @@ func (m *model) msgPanelBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		return 0
 	}
@@ -3649,7 +3649,7 @@ func (m *model) logBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		return 0
 	}
@@ -3856,11 +3856,18 @@ func (m *model) filesBodyHeight() int {
 	if m.w == 0 || m.h == 0 {
 		return 0
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		return 0
 	}
 	return lo.Files.H - 1
+}
+
+// layout computes the current layout, shrinking the middle row to fit
+// the number of files currently visible under the active filter so
+// the diff panel can expand when the file list is short.
+func (m *model) layout() layout.Layout {
+	return layout.ComputeWith(m.w, m.h, len(m.fileFilterVisible))
 }
 
 var (
@@ -4852,7 +4859,7 @@ func (m model) View() string {
 	if m.w == 0 || m.h == 0 {
 		return ""
 	}
-	lo := layout.Compute(m.w, m.h)
+	lo := m.layout()
 	if lo.TooSmall {
 		msg := fmt.Sprintf("Terminal too small (need ≥%dx%d)", layout.MinCols, layout.MinRows)
 		body := msg + "\n" + tooSmallHintStyle.Render("q to quit")

@@ -137,12 +137,26 @@ func ScrollbarThumb(total, visible, offset, height int) (start, length int, draw
 }
 
 // Compute returns the panel rectangles for the given terminal size.
+// Equivalent to ComputeWith(w, h, -1): the middle row uses its full
+// MiddleContentRows + 1 height regardless of how many files are
+// visible.
+func Compute(w, h int) Layout {
+	return ComputeWith(w, h, -1)
+}
+
+// ComputeWith returns the panel rectangles for the given terminal
+// size, shrinking the middle row to fit `visibleFiles` rows in the
+// files panel when that is smaller than the default. Pass
+// visibleFiles < 0 to disable shrinking (full middle height). In
+// small mode the middle row is a single tabbed region shared by all
+// middle tabs, so shrinking is not applied there.
+//
 // The log panel is pinned at LogContentRows + 1 rows; the middle row
-// is pinned at MiddleContentRows + 1 rows; the diff panel fills the
+// is at most MiddleContentRows + 1 rows; the diff panel fills the
 // remaining height above the one-row status strip. When w < MinCols
 // or h < MinRows, Layout.TooSmall is true and the other fields are
 // zeroed.
-func Compute(w, h int) Layout {
+func ComputeWith(w, h, visibleFiles int) Layout {
 	if w < MinCols || h < MinRows {
 		return Layout{TooSmall: true}
 	}
@@ -152,6 +166,21 @@ func Compute(w, h int) Layout {
 
 	logH := LogContentRows + 1
 	middleH := MiddleContentRows + 1
+	if visibleFiles >= 0 && w >= SmallModeMinCols {
+		// Files panel = 1 title row + content rows. Cap content at
+		// the default (MiddleContentRows + 1 - MetadataContentRows -
+		// 1) and floor at 1 so the panel always has at least one
+		// content row to show "no matches" / a single entry.
+		maxContent := MiddleContentRows + 1 - MetadataContentRows - 1
+		filesContent := visibleFiles
+		if filesContent < 1 {
+			filesContent = 1
+		}
+		if filesContent > maxContent {
+			filesContent = maxContent
+		}
+		middleH = MetadataContentRows + filesContent + 1
+	}
 	// Two 1-row vertical gaps inside the usable region: one between
 	// the log and the middle row, one between the middle row and the
 	// diff.
