@@ -27,7 +27,7 @@
       };
       packages.default = pkgs.buildGoModule {
         pname = "git-review-tui";
-        version = "1.6.1";
+        version = "1.6.5";
         src = ./.;
         vendorHash = "sha256-JKIFZxO3L0cDVbT8ZD/KtDzjBtTuBLkq/e3PSXZ0kaw=";
         buildInputs = [pkgs.git];

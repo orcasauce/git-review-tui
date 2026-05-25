@@ -965,6 +965,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch keyStr {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "ctrl+z":
+			return m, tea.Suspend
 		case "?":
 			m.helpModalOpen = true
 			m.pendingG = false
